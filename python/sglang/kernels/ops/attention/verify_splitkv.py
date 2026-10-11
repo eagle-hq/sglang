@@ -32,13 +32,14 @@ the caller falls back to ``extend_attention_fwd``. Supported case: causal
 sliding-window / logit-cap / xai-temperature. Correctness is never violated.
 """
 
+import functools
 import os
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 _MIN_BLOCK_KV = 32
 
@@ -116,6 +117,45 @@ TREE_COMBINE_DV_TILE = 64
 # per-head stage has more programs to fill the device).
 TREE_MIN_SPLIT_KEYS = 256
 GQA_MIN_BS = 4
+# FlyDSL prefix stage (verify_prefix_flydsl.py) in place of both Triton prefix stages on
+# gfx950 for bf16, head dim 256. Whole verify attention per layer on MI355X, split
+# counts as under HIP graphs: 1.2-1.8x faster for batch >= 4 or prefix >= 8K (3.1x for a
+# batch-1 32K chain); at batch 1 with a ~1K prefix 2-6 us slower. With it the GQA layout
+# serves every batch size, chains take up to GQA_MAX_N_SPLITS splits (the chain combine
+# merges them in chunks) and splits hold at least FLY_TREE_MIN_SPLIT_KEYS /
+# FLY_CHAIN_MIN_SPLIT_KEYS keys. SGLANG_SPLITKV_VERIFY_FLYDSL=0: Triton.
+FLYDSL = os.environ.get("SGLANG_SPLITKV_VERIFY_FLYDSL", "1") != "0"
+FLY_TREE_MIN_SPLIT_KEYS = 256
+FLY_CHAIN_MIN_SPLIT_KEYS = 64
+
+
+@functools.lru_cache(maxsize=None)
+def _flydsl_supported():
+    if not (_IS_HIP and is_gfx95_supported()):
+        return False
+    try:
+        from sglang.kernels.ops.attention import verify_prefix_flydsl  # noqa: F401
+    except Exception:  # FlyDSL missing or too old
+        return False
+    return True
+
+
+def use_flydsl(q, k_buffer, v_buffer, kv_indptr, kv_indices, k_scale, v_scale):
+    """Static checks (no device reads, graph safe) for the FlyDSL prefix stage."""
+    return (
+        FLYDSL
+        and _flydsl_supported()
+        and q.dtype == k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+        and q.shape[2] == k_buffer.shape[2] == v_buffer.shape[2] == 256
+        and q.stride(2) == 1 and q.stride(1) == 256
+        and k_buffer.stride(2) == v_buffer.stride(2) == 1
+        and k_buffer.stride(1) == v_buffer.stride(1) == 256
+        and k_buffer.stride(0) == v_buffer.stride(0)
+        and kv_indptr.dtype == torch.int32
+        and kv_indices.dtype == torch.int64
+        and float(k_scale) == 1.0
+        and float(v_scale) == 1.0
+    )
 
 
 def gqa_rows(group, l_pad):
@@ -334,6 +374,7 @@ def _verify_combine_stage2(
     O_Out,  # [extend_tokens, H_Q, Dv]  (final, written)
     sm_scale,
     qo_indptr,  # [BS+1] int32
+    kv_indptr,  # [BS+1] int32 (prefix lengths)
     stride_ob,
     stride_oh,
     stride_os,
@@ -356,6 +397,9 @@ def _verify_combine_stage2(
     V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    SPLIT_CHUNK: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    MIN_SPLIT_KEYS: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -364,44 +408,56 @@ def _verify_combine_stage2(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
     offs_l = tl.arange(0, L_EXT)
-    offs_s = tl.arange(0, N_SPLITS)
 
     cur_q_start = tl.load(qo_indptr + cur_batch)
     l_ext = tl.load(qo_indptr + cur_batch + 1) - cur_q_start
     mask_l = offs_l < l_ext
+    # The splits stage 1 actually ran (same sizing): the rest hold only -inf sentinels.
+    prefix_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+    kv_len_per_split = tl.maximum(
+        tl.cdiv(tl.cdiv(prefix_len, N_SPLITS), MIN_BLOCK_KV) * MIN_BLOCK_KV, MIN_SPLIT_KEYS
+    )
+    n_active = tl.cdiv(prefix_len, kv_len_per_split)
 
     # ---- (a) combine prefix splits (logsumexp) ----------------------------
-    # lse: [N_SPLITS, L_EXT]
-    offs_lse = (
-        cur_batch * stride_lb
-        + cur_head * stride_lh
-        + offs_s[:, None] * stride_ls
-        + offs_l[None, :]
-    )
-    lse = tl.load(
-        offs_lse + Att_Lse,
-        mask=mask_l[None, :],
-        other=float("-inf"),
-    )  # [N_SPLITS, L_EXT]
-    m_p = tl.max(lse, 0)  # [L_EXT]
-    w = tl.exp(lse - m_p[None, :])  # [N_SPLITS, L_EXT]; -inf->0
-    denom_p = tl.sum(w, 0)  # [L_EXT]
-
-    # weighted-sum of partial outputs: o_prefix[L_EXT, Dv]
-    # Att_Out[b,h,s,l,dv]
-    offs_ao = (
-        cur_batch * stride_ob
-        + cur_head * stride_oh
-        + offs_s[:, None, None] * stride_os
-        + offs_l[None, :, None] * stride_ol
-        + offs_dv[None, None, :]
-    )
-    ao = tl.load(
-        offs_ao + Att_Out,
-        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
-        other=0.0,
-    )  # [N_SPLITS, L_EXT, Dv]
-    o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
+    # SPLIT_CHUNK active splits at a time with a running max, so N_SPLITS can exceed
+    # what one [N_SPLITS, L_EXT, Dv] tile holds. Empty splits (LSE -inf; their partial
+    # outputs are never written) get weight 0 and their outputs are not read.
+    offs_s = tl.arange(0, SPLIT_CHUNK)
+    m_p = tl.zeros([L_EXT], dtype=tl.float32) - 1.0e30
+    denom_p = tl.zeros([L_EXT], dtype=tl.float32)
+    o_prefix = tl.zeros([L_EXT, BLOCK_DV], dtype=tl.float32)
+    for s0 in range(0, n_active, SPLIT_CHUNK):
+        offs_lse = (
+            cur_batch * stride_lb
+            + cur_head * stride_lh
+            + (s0 + offs_s)[:, None] * stride_ls
+            + offs_l[None, :]
+        )
+        lse = tl.load(
+            offs_lse + Att_Lse,
+            mask=((s0 + offs_s) < n_active)[:, None] & mask_l[None, :],
+            other=float("-inf"),
+        )  # [SPLIT_CHUNK, L_EXT]
+        m_new = tl.maximum(m_p, tl.max(lse, 0))
+        rescale = tl.exp(m_p - m_new)
+        w = tl.exp(lse - m_new[None, :])  # -inf -> 0
+        # Att_Out[b,h,s,l,dv]
+        offs_ao = (
+            cur_batch * stride_ob
+            + cur_head * stride_oh
+            + (s0 + offs_s)[:, None, None] * stride_os
+            + offs_l[None, :, None] * stride_ol
+            + offs_dv[None, None, :]
+        )
+        ao = tl.load(
+            offs_ao + Att_Out,
+            mask=(w[:, :, None] > 0) & mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+            other=0.0,
+        )  # [SPLIT_CHUNK, L_EXT, Dv]
+        o_prefix = o_prefix * rescale[:, None] + tl.sum(ao * w[:, :, None], 0)
+        denom_p = denom_p * rescale + tl.sum(w, 0)
+        m_p = m_new
     o_prefix = o_prefix / denom_p[:, None]
     lse_prefix = m_p + tl.log(denom_p)  # [L_EXT]
 
@@ -631,6 +687,7 @@ def _verify_combine_stage2_tree(
     DV_TILE: tl.constexpr,  # output columns per program (grid axis 2 covers BLOCK_DV)
     MIN_BLOCK_KV: tl.constexpr,
     MIN_SPLIT_KEYS: tl.constexpr,
+    SPLIT_UNROLL: tl.constexpr = 4,
 ):
     """_verify_combine_stage2 for a draft TREE (topk > 1): the draft-draft block
     follows the custom tree mask instead of the causal one. The mask is read
@@ -676,27 +733,30 @@ def _verify_combine_stage2_tree(
     m_p = tl.max(lse, 0)
     m_p_safe = tl.where(m_p == float("-inf"), 0.0, m_p)
     denom_p = tl.sum(tl.exp(lse - m_p_safe[None, :]), 0)
-    # Weighted sum of the split partials, one split at a time: [N_SPLITS, L_EXT, Dv]
-    # in one tile does not fit in registers at tree sizes (L_EXT up to 64).
+    # Weighted sum of the split partials, SPLIT_UNROLL splits per iteration (their loads
+    # in flight together): [N_SPLITS, L_EXT, Dv] in one tile does not fit in registers
+    # at tree sizes (L_EXT up to 64).
     o_prefix = tl.zeros([L_EXT, DV_TILE], dtype=tl.float32)
-    for s in range(0, n_active):
-        lse_s = tl.load(
-            Att_Lse + cur_batch * stride_lb + cur_head * stride_lh + s * stride_ls + offs_l,
-            mask=mask_l,
-            other=float("-inf"),
-        )
-        w_s = tl.exp(lse_s - m_p_safe)
-        ao_s = tl.load(
-            Att_Out
-            + cur_batch * stride_ob
-            + cur_head * stride_oh
-            + s * stride_os
-            + offs_l[:, None] * stride_ol
-            + offs_dv[None, :],
-            mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM) & (w_s[:, None] > 0.0),
-            other=0.0,
-        )
-        o_prefix += ao_s * w_s[:, None]
+    for s0 in range(0, n_active, SPLIT_UNROLL):
+        for u in tl.static_range(SPLIT_UNROLL):
+            s = s0 + u
+            lse_s = tl.load(
+                Att_Lse + cur_batch * stride_lb + cur_head * stride_lh + s * stride_ls + offs_l,
+                mask=mask_l & (s < n_active),
+                other=float("-inf"),
+            )
+            w_s = tl.exp(lse_s - m_p_safe)
+            ao_s = tl.load(
+                Att_Out
+                + cur_batch * stride_ob
+                + cur_head * stride_oh
+                + s * stride_os
+                + offs_l[:, None] * stride_ol
+                + offs_dv[None, :],
+                mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM) & (w_s[:, None] > 0.0),
+                other=0.0,
+            )
+            o_prefix += ao_s * w_s[:, None]
     denom_p_safe = tl.where(denom_p == 0.0, 1.0, denom_p)
     o_prefix = o_prefix / denom_p_safe[:, None]
     lse_prefix = tl.where(denom_p == 0.0, float("-inf"), m_p_safe + tl.log(denom_p_safe))
@@ -772,6 +832,7 @@ class VerifySplitKV:
         num_warps=DEFAULT_NUM_WARPS,
         tree=False,
         gqa=False,
+        fly=False,
     ):
         self.h_q = h_q
         self.h_kv = h_kv
@@ -785,6 +846,13 @@ class VerifySplitKV:
         if tree:
             self.l_pad = max(16, self.l_pad)
         self.gqa = gqa
+        self.fly = fly
+        # Tree splits hold at least this many prefix keys (sized in-kernel from the
+        # real prefix length); the prefix and combine stages must agree on it.
+        if fly:
+            self.min_split_keys = FLY_TREE_MIN_SPLIT_KEYS if tree else FLY_CHAIN_MIN_SPLIT_KEYS
+        else:
+            self.min_split_keys = TREE_MIN_SPLIT_KEYS if tree else 0
         self.device = device
         self.n_splits = n_splits
         self.block_n = block_n
@@ -822,6 +890,15 @@ class VerifySplitKV:
         k_scale,
         v_scale,
     ):
+        if self.fly:
+            from sglang.kernels.ops.attention.verify_prefix_flydsl import verify_prefix_gqa
+
+            verify_prefix_gqa(
+                q_extend, k_buffer, v_buffer, kv_indptr, kv_indices, self.att_out, self.att_lse,
+                bs=bs, l_ext=self.l_ext, l_pad=self.l_pad, n_splits=self.n_splits,
+                min_split_keys=self.min_split_keys, sm_scale=sm_scale,
+            )
+            return
         if self.gqa:
             rows, n_chunks = gqa_rows(self.group, self.l_pad)
             _verify_prefix_stage1_gqa[(bs, self.h_kv * n_chunks, self.n_splits)](
@@ -859,7 +936,7 @@ class VerifySplitKV:
                 BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
                 BLOCK_N=GQA_BLOCK_N,
                 MIN_BLOCK_KV=_MIN_BLOCK_KV,
-                MIN_SPLIT_KEYS=TREE_MIN_SPLIT_KEYS if self.tree else 0,
+                MIN_SPLIT_KEYS=self.min_split_keys,
                 num_warps=GQA_NUM_WARPS,
                 num_stages=1,
                 **_AMD_LAUNCH_KWARGS,
@@ -900,14 +977,14 @@ class VerifySplitKV:
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
-            MIN_SPLIT_KEYS=TREE_MIN_SPLIT_KEYS if self.tree else 0,
+            MIN_SPLIT_KEYS=self.min_split_keys,
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,
         )
 
     def _run_combine_kernel(
-        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale
+        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, kv_indptr, sm_scale
     ):
         grid = (bs, self.h_q)
         _verify_combine_stage2[grid](
@@ -919,6 +996,7 @@ class VerifySplitKV:
             o_out,
             sm_scale,
             qo_indptr,
+            kv_indptr,
             self.att_out.stride(0),
             self.att_out.stride(1),
             self.att_out.stride(2),
@@ -941,6 +1019,9 @@ class VerifySplitKV:
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            SPLIT_CHUNK=min(self.n_splits, MAX_N_SPLITS),
+            MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            MIN_SPLIT_KEYS=self.min_split_keys,
             num_warps=1,
             num_stages=1,
         )
@@ -987,7 +1068,7 @@ class VerifySplitKV:
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             DV_TILE=dv_tile,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
-            MIN_SPLIT_KEYS=TREE_MIN_SPLIT_KEYS,
+            MIN_SPLIT_KEYS=self.min_split_keys,
             num_warps=4,
             num_stages=1,
         )
@@ -1045,6 +1126,7 @@ class VerifySplitKV:
             v_extend,
             o_out,
             qo_indptr,
+            kv_indptr,
             sm_scale,
         )
         return o_out
@@ -1063,9 +1145,9 @@ _VK_CACHE = {}
 
 def _get_vk(
     max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device, n_splits=DEFAULT_N_SPLITS,
-    tree=False, gqa=False,
+    tree=False, gqa=False, fly=False,
 ):
-    key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device), n_splits, tree, gqa)
+    key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device), n_splits, tree, gqa, fly)
     vk = _VK_CACHE.get(key)
     if vk is None:
         block_n, num_warps = block_config(head_dim)
@@ -1082,6 +1164,7 @@ def _get_vk(
             num_warps=num_warps,
             tree=tree,
             gqa=gqa,
+            fly=fly,
         )
         _VK_CACHE[key] = vk
     else:
@@ -1271,16 +1354,17 @@ def verify_splitkv_fwd(
     # mixed-length batches stay correct -- shorter seqs simply write fewer
     # active splits (the rest emit the -inf lse sentinel, ignored in stage2).
     avg_seqlen = kv_indices.shape[0] / max(1, bs)
+    fly = use_flydsl(q_extend, k_buffer, v_buffer, kv_indptr, kv_indices, k_scale, v_scale)
     # Graphs are captured per batch size, not per context: pick the prefix stage by bs.
-    use_gqa = bs >= GQA_MIN_BS and (TREE_GQA if tree_mask else CHAIN_GQA)
+    use_gqa = fly or (bs >= GQA_MIN_BS and (TREE_GQA if tree_mask else CHAIN_GQA))
     if use_gqa:
         l_pad = triton.next_power_of_2(int(max_len_extend))
         if tree_mask:
             l_pad = max(16, l_pad)
         _, n_chunks = gqa_rows(h_q // h_kv, l_pad)
         n_splits = choose_n_splits_gqa(avg_seqlen, bs, h_kv, n_chunks)
-        if not tree_mask:
-            # The chain combine loads every split's [L_EXT, Dv] partial at once.
+        if not tree_mask and not fly:
+            # Measured cap for the Triton chain stages (the combine handles more).
             n_splits = min(n_splits, MAX_N_SPLITS)
     else:
         n_splits = choose_n_splits(avg_seqlen)
@@ -1300,6 +1384,7 @@ def verify_splitkv_fwd(
         n_splits=n_splits,
         tree=tree_mask,
         gqa=use_gqa,
+        fly=fly,
     )
     vk(
         q_extend,
