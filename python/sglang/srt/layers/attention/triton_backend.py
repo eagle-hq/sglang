@@ -208,6 +208,9 @@ class TritonAttnBackend(AttentionBackend):
         self._dense_one_shot_kv_indptr = None
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
+        self._verify_splitkv_tree_fwd = torch.compiler.disable(
+            lambda *args, **kwargs: verify_splitkv_fwd(*args, tree_mask=True, **kwargs)
+        )
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
 
@@ -239,6 +242,12 @@ class TritonAttnBackend(AttentionBackend):
             is_gfx95_supported()
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
             and self.topk == 1
+        )
+        # Draft trees (topk > 1): split-KV prefix plus a tree-masked draft-draft block.
+        self.use_verify_splitkv_tree = (
+            is_gfx95_supported()
+            and envs.SGLANG_ENABLE_SPLITKV_VERIFY_TREE.get()
+            and self.topk > 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
@@ -1852,6 +1861,8 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
+        elif self.use_verify_splitkv_tree:
+            verify_fwd = self._verify_splitkv_tree_fwd
         else:
             verify_fwd = None
         if (
