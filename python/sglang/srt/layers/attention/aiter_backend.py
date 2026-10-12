@@ -367,18 +367,35 @@ class AiterAttnBackend(AttentionBackend):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+        from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
 
         self.input_dtype = model_runner.model_config.dtype
 
         self.page_size = get_schedule().page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self._verify_splitkv_tree_fwd = torch.compiler.disable(
+            lambda *args, **kwargs: verify_splitkv_fwd(
+                *args, tree_mask=True, **kwargs
+            )
+        )
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = topk
+        # EAGLE-Harness target verify already falls back to the Triton
+        # extend-attention kernel when topk > 1.  On gfx95, replace only that
+        # serial-prefix call with the graph-safe split-KV tree implementation;
+        # all other AITER attention paths and all non-ROCm backends are
+        # unchanged.  The environment switch is shared with TritonAttnBackend
+        # so the same-source disabled arm remains available for A/B tests.
+        self.use_verify_splitkv_tree = (
+            is_gfx95_supported()
+            and envs.SGLANG_ENABLE_SPLITKV_VERIFY_TREE.get()
+            and self.topk > 1
+        )
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -4251,6 +4268,35 @@ class AiterAttnBackend(AttentionBackend):
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self._reject_target_verify_cross_layer_kv(k, v)
+
+                if self.use_verify_splitkv_tree and self._verify_splitkv_tree_fwd(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous(),
+                    v.contiguous(),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.custom_mask,
+                    True,
+                    self.forward_metadata.mask_indptr,
+                    self.forward_metadata.max_extend_len,
+                    1.0,
+                    1.0,
+                    layer.scaling,
+                    logit_cap=layer.logit_cap,
+                    sliding_window_size=(
+                        layer.sliding_window_size
+                        if layer.sliding_window_size is not None
+                        else -1
+                    ),
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                    max_bs=self.req_to_token_pool.size,
+                ):
+                    return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
