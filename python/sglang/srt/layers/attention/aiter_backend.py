@@ -394,7 +394,11 @@ class AiterAttnBackend(AttentionBackend):
         self.use_verify_splitkv_tree = (
             is_gfx95_supported()
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY_TREE.get()
-            and self.topk > 1
+            # The target backend is built by the attention registry with the
+            # constructor default (topk=1); the speculative tree width lives
+            # in the process-wide runtime context.  Draft backends may still
+            # pass topk explicitly, so retain it as a fallback.
+            and (get_spec().speculative_eagle_topk or self.topk) > 1
         )
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
