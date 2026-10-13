@@ -125,6 +125,9 @@ GQA_MIN_BS = 4
 # merges them in chunks) and splits hold at least FLY_TREE_MIN_SPLIT_KEYS /
 # FLY_CHAIN_MIN_SPLIT_KEYS keys. SGLANG_SPLITKV_VERIFY_FLYDSL=0: Triton.
 FLYDSL = os.environ.get("SGLANG_SPLITKV_VERIFY_FLYDSL", "1") != "0"
+# With it, the combine stage in FlyDSL too (verify_combine_flydsl.py, up to 16 draft tokens):
+# SGLANG_SPLITKV_VERIFY_FLYDSL_COMBINE=0 keeps the Triton combine.
+FLYDSL_COMBINE = os.environ.get("SGLANG_SPLITKV_VERIFY_FLYDSL_COMBINE", "1") != "0"
 FLY_TREE_MIN_SPLIT_KEYS = 256
 FLY_CHAIN_MIN_SPLIT_KEYS = 64
 
@@ -1113,6 +1116,17 @@ class VerifySplitKV:
             v_scale,
         )
         # 2+3+4. fused combine + draft-draft + merge
+        if self.fly and FLYDSL_COMBINE and self.l_ext <= 16:
+            # with the FlyDSL prefix stage, the FlyDSL combine (tree and chain): FlyDSL end to end
+            from sglang.kernels.ops.attention.verify_combine_flydsl import verify_combine
+
+            verify_combine(
+                self.att_out, self.att_lse, q_extend, k_extend, v_extend, o_out, qo_indptr, kv_indptr,
+                bs=bs, l_pad=self.l_pad, n_splits=self.n_splits, min_split_keys=self.min_split_keys,
+                sm_scale=sm_scale, custom_mask=custom_mask if self.tree else None,
+                mask_indptr=mask_indptr if self.tree else None,
+            )
+            return o_out
         if self.tree:
             self._run_combine_tree_kernel(
                 bs, q_extend, k_extend, v_extend, o_out, qo_indptr, kv_indptr,
