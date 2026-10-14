@@ -20,18 +20,31 @@ Not implemented (asserted): appending new k/v into the cache, rotary, qv, descal
 cache_batch_idx / cache_leftpad, sinks, score_mod, a right window wider than causal.
 Scheduling arguments (num_splits, pack_gqa, scheduler_metadata, sm_margin, ver) are
 accepted and ignored.
+
+Split-KV: with few (query block, sequence, head) programs -- the EAGLE-Harness draft step
+attends 4 tree rows x 40 heads over a 4096-key window at batch 1, 40 programs -- each
+program walks only a slice of the key range (same masks) and writes a normalized fp32
+partial and its LSE; a combine kernel merges them. The split count comes from static
+shapes (HIP-graph safe), the slice size from the real key length.
+SGLANG_ROCM_FA_SPLIT_KV=0 keeps one program per (query block, sequence, head).
 """
 
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+SPLIT_KV = os.environ.get("SGLANG_ROCM_FA_SPLIT_KV", "1") != "0"
+SPLIT_TARGET_PROGRAMS = 1024  # ~4 programs per CU on MI355X
+SPLIT_MIN_KEYS = 256  # keys per split at the cache's capacity
+SPLIT_MAX = 32
+
 
 @triton.jit
 def _fa_kvcache_fwd_kernel(
-    Q, K, V, O, LSE,
+    Q, K, V, O, LSE, O_PART, LSE_PART,
     cu_seqlens_q, seqlens_k, cu_seqlens_k, page_table,
     stride_qt, stride_qh,
     stride_kb, stride_ks, stride_kh,
@@ -41,6 +54,7 @@ def _fa_kvcache_fwd_kernel(
     stride_pt_b,
     sm_scale, softcap,
     window_left,
+    num_heads, total_q,
     GQA: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -52,10 +66,12 @@ def _fa_kvcache_fwd_kernel(
     USE_WINDOW: tl.constexpr,
     USE_SOFTCAP: tl.constexpr,
     WRITE_LSE: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     b = tl.program_id(1)
-    h = tl.program_id(2)
+    h = tl.program_id(2) % num_heads
+    split = tl.program_id(2) // num_heads
     kvh = h // GQA
 
     q_start = tl.load(cu_seqlens_q + b)
@@ -94,6 +110,13 @@ def _fa_kvcache_fwd_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     qk_scale = sm_scale * 1.4426950408889634  # log2(e): exp2 below
+
+    if NUM_SPLITS > 1:
+        # BLOCK_N-aligned slices of [k_start, k_end): the loop's last block of one slice
+        # never reaches into the next one.
+        chunk = tl.cdiv(tl.cdiv(k_end - k_start, NUM_SPLITS), BLOCK_N) * BLOCK_N
+        k_start = k_start + split * chunk
+        k_end = tl.minimum(k_end, k_start + chunk)
 
     for start_n in range(k_start, k_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -141,15 +164,65 @@ def _fa_kvcache_fwd_kernel(
 
     l_safe = tl.where(l_i == 0.0, 1.0, l_i)
     out = acc / l_safe[:, None]
-    tl.store(
-        O + (q_start + offs_m)[:, None] * stride_ot + h * stride_oh + offs_d[None, :],
-        out.to(O.dtype.element_ty),
-        mask=m_mask[:, None] & d_mask[None, :],
-    )
+    # m_i is in log2 units; LSE in natural log.
+    lse = tl.where(l_i == 0.0, float("-inf"), (m_i + tl.log2(l_safe)) * 0.6931471805599453)
+    if NUM_SPLITS > 1:
+        # Partials [NUM_SPLITS, total_q, num_heads, BLOCK_D] and [NUM_SPLITS, num_heads, total_q].
+        row = split * total_q + q_start + offs_m
+        tl.store(
+            O_PART + (row[:, None] * num_heads + h) * BLOCK_D + offs_d[None, :],
+            out,
+            mask=m_mask[:, None],
+        )
+        tl.store(LSE_PART + (split * num_heads + h) * total_q + q_start + offs_m, lse, mask=m_mask)
+    else:
+        tl.store(
+            O + (q_start + offs_m)[:, None] * stride_ot + h * stride_oh + offs_d[None, :],
+            out.to(O.dtype.element_ty),
+            mask=m_mask[:, None] & d_mask[None, :],
+        )
+        if WRITE_LSE:
+            tl.store(LSE + h * stride_lse_h + q_start + offs_m, lse, mask=m_mask)
+
+
+@triton.jit
+def _fa_split_combine_kernel(
+    O, LSE, O_PART, LSE_PART, cu_seqlens_q, batch,
+    stride_ot, stride_oh,
+    stride_lse_h,
+    num_heads, total_q,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
+):
+    """Merge the split partials of one (query row, head) by log-sum-exp. Rows past the last
+    sequence (graph padding) have no partials and stay untouched, as without splits."""
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    if t >= tl.load(cu_seqlens_q + batch):
+        return
+    offs_s = tl.arange(0, NUM_SPLITS)
+    offs_d = tl.arange(0, BLOCK_D)
+    lse_s = tl.load(LSE_PART + (offs_s * num_heads + h) * total_q + t)
+    m = tl.max(lse_s, 0)
+    m_safe = tl.where(m == float("-inf"), 0.0, m)
+    w = tl.exp(lse_s - m_safe)  # 0 for empty splits (lse -inf)
+    denom = tl.sum(w, 0)
+    o_s = tl.load(O_PART + ((offs_s[:, None] * total_q + t) * num_heads + h) * BLOCK_D + offs_d[None, :])
+    out = tl.sum(o_s * w[:, None], 0) / tl.where(denom == 0.0, 1.0, denom)
+    tl.store(O + t * stride_ot + h * stride_oh + offs_d, out.to(O.dtype.element_ty), mask=offs_d < HEAD_DIM)
     if WRITE_LSE:
-        # m_i is in log2 units; LSE in natural log.
-        lse = tl.where(l_i == 0.0, float("-inf"), (m_i + tl.log2(l_safe)) * 0.6931471805599453)
-        tl.store(LSE + h * stride_lse_h + q_start + offs_m, lse, mask=m_mask)
+        tl.store(LSE + h * stride_lse_h + t, tl.where(denom == 0.0, float("-inf"), m_safe + tl.log(denom)))
+
+
+def _num_splits(q_blocks, batch, num_heads, max_keys):
+    """Power-of-two split count from static shapes: enough programs to fill the device, at
+    least SPLIT_MIN_KEYS keys per split at the cache's capacity."""
+    if not SPLIT_KV or max_keys is None:
+        return 1
+    n = min(SPLIT_MAX, SPLIT_TARGET_PROGRAMS // max(1, q_blocks * batch * num_heads), max_keys // SPLIT_MIN_KEYS)
+    return 1 << (n.bit_length() - 1) if n >= 2 else 1
 
 
 def _launch(
@@ -190,9 +263,24 @@ def _launch(
     block_m = 16 if max_seqlen_q <= 16 else 64
     block_n = 64
     block_d = triton.next_power_of_2(head_dim)
-    grid = (triton.cdiv(max_seqlen_q, block_m), batch, num_heads)
+    q_blocks = triton.cdiv(max_seqlen_q, block_m)
+    # The key capacity, from shapes only: the page table's width (paged) or the cache
+    # length (contiguous cache); dense varlen keys keep one program per head.
+    if paged:
+        max_keys = page_table.shape[1] * page_size
+    elif cu_seqlens_k is not None and cu_seqlens_k.numel() - 1 == batch and k.shape[0] % max(batch, 1) == 0:
+        max_keys = k.shape[0] // max(batch, 1)
+    else:
+        max_keys = None
+    num_splits = _num_splits(q_blocks, batch, num_heads, max_keys)
+    if num_splits > 1:
+        o_part = torch.empty((num_splits, total_q, num_heads, block_d), dtype=torch.float32, device=q.device)
+        lse_part = torch.empty((num_splits, num_heads, total_q), dtype=torch.float32, device=q.device)
+    else:
+        o_part = lse_part = out  # placeholder pointers, never written
+    grid = (q_blocks, batch, num_heads * num_splits)
     _fa_kvcache_fwd_kernel[grid](
-        q, k, v, out, lse,
+        q, k, v, out, lse, o_part, lse_part,
         cu_seqlens_q, seqlens_k, cu_seqlens_k if cu_seqlens_k is not None else seqlens_k,
         page_table if paged else seqlens_k,
         q.stride(0), q.stride(1),
@@ -203,6 +291,7 @@ def _launch(
         stride_pt_b,
         softmax_scale, softcap if softcap else 1.0,
         left if left >= 0 else 0,
+        num_heads, total_q,
         GQA=num_heads // num_kv_heads,
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
@@ -214,9 +303,22 @@ def _launch(
         USE_WINDOW=left >= 0,
         USE_SOFTCAP=bool(softcap),
         WRITE_LSE=bool(return_softmax_lse),
+        NUM_SPLITS=num_splits,
         num_warps=4,
         num_stages=1,
     )
+    if num_splits > 1:
+        _fa_split_combine_kernel[(total_q, num_heads)](
+            out, lse, o_part, lse_part, cu_seqlens_q, batch,
+            out.stride(0), out.stride(1),
+            lse.stride(0) if return_softmax_lse else 0,
+            num_heads, total_q,
+            HEAD_DIM=head_dim,
+            BLOCK_D=block_d,
+            NUM_SPLITS=num_splits,
+            WRITE_LSE=bool(return_softmax_lse),
+            num_warps=4,
+        )
     return (out, lse) if return_softmax_lse else out
 
 
