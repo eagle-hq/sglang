@@ -1,8 +1,11 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -313,15 +316,60 @@ class TestConformanceGuard(_RegistryIsolated):
                 return MagicMock
 
     def test_enum_interface_subset_of_custom_spec_algo(self):
-        # Every is_*/supports_* method on the enum exists on CustomSpecAlgo.
-        # vars() (not dir()) because EnumMeta.__dir__ hides instance methods.
+        # Every public method on the enum exists on CustomSpecAlgo: the
+        # scheduler calls more than the predicates (create_future_map at init,
+        # need_topk in the relay). vars() (not dir()) because EnumMeta.__dir__
+        # hides instance methods.
         interface = {
             name
-            for name in vars(SpeculativeAlgorithm)
-            if name.startswith(("is_", "supports_"))
+            for name, value in vars(SpeculativeAlgorithm).items()
+            if not name.startswith("_") and inspect.isfunction(value)
         }
-        self.assertTrue(interface)  # guard against an empty (no-op) interface
+        self.assertIn("create_future_map", interface)
         self.assertEqual(interface - set(dir(CustomSpecAlgo)), set())
+
+    def test_missing_scheduler_method_raises(self):
+        Stub = type(
+            "Stub",
+            (),
+            {
+                name: value
+                for name, value in vars(CustomSpecAlgo).items()
+                if name != "create_future_map"
+            },
+        )
+        with self.assertRaisesRegex(TypeError, "create_future_map"):
+            _assert_custom_spec_algo_conforms(Stub)
+
+
+class TestRelayDefaults(_RegistryIsolated):
+    """The relay-facing defaults follow the algorithm's is_eagle()."""
+
+    def test_need_topk_and_hidden_states_follow_is_eagle(self):
+        class EagleLike(CustomSpecAlgo):
+            def is_eagle(self) -> bool:
+                return True
+
+        plain = CustomSpecAlgo("MY_PLAIN", MagicMock)
+        eagle = EagleLike("MY_EAGLE_LIKE", MagicMock)
+        self.assertFalse(plain.need_topk())
+        self.assertFalse(plain.carries_draft_hidden_states())
+        self.assertTrue(eagle.need_topk())
+        self.assertTrue(eagle.carries_draft_hidden_states())
+
+    def test_create_future_map_builds_the_relay_for_this_algorithm(self):
+        from sglang.srt.managers import overlap_utils
+
+        algo = CustomSpecAlgo("MY_RELAY", MagicMock)
+        pool = MagicMock()
+        with patch.object(overlap_utils, "FutureMap") as future_map:
+            result = algo.create_future_map(
+                torch.device("cpu"), pool, needs_cpu_seq_lens=False
+            )
+        future_map.assert_called_once_with(
+            torch.device("cpu"), algo, pool, False, False
+        )
+        self.assertIs(result, future_map.return_value)
 
 
 class TestCrossTypeIdentity(_RegistryIsolated):
