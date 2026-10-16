@@ -21,7 +21,7 @@ from sglang.srt.speculative.spec_registry import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -169,6 +169,26 @@ class SpeculativeAlgorithm(Enum):
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+
+    def supports_mm_inputs(self) -> bool:
+        """Whether requests with multimodal inputs may be served (also picks
+        the multimodal server warmup)."""
+        return True
+
+    def validate_request(
+        self, req: Req, *, has_mm_inputs: bool, enable_overlap: bool
+    ) -> Optional[str]:
+        """Return why this algorithm cannot serve ``req``, or ``None``. The
+        scheduler aborts the request with the message before admitting it."""
+        if self.is_dflash_family():
+            from sglang.srt.speculative.dflash_utils import validate_dflash_request
+
+            return validate_dflash_request(req, enable_overlap)
+        if self.is_uno():
+            from sglang.srt.speculative.uno_validation import validate_uno_request
+
+            return validate_uno_request(req)
+        return None
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
