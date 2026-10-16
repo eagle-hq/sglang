@@ -2107,11 +2107,27 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
+        # Custom logit processors may read __req__.output_ids (thinking budget,
+        # no-repeat n-gram), but sampling runs before the overlap loop appends
+        # the previous result, so they would see one token too few. Settle the
+        # pending result first. Like need_grammar_sync this is a per-rank
+        # decision; it only moves pop_and_process() before this rank's launch,
+        # which issues no collectives, so DP ranks that disagree cannot deadlock.
+        need_custom_processor_sync = bool(
+            batch
+            and batch.sampling_info is not None
+            and batch.sampling_info.has_custom_logit_processor
+            and (batch.forward_mode.is_decode() or batch.forward_mode.is_extend())
+            and len(self.result_queue) > 0
+        )
+
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
         # whatever result is still pending in the queue — including the
         # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch or need_grammar_sync or need_custom_processor_sync
+        )
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
