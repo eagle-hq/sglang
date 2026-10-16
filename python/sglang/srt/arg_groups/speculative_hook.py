@@ -248,6 +248,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
+    if cfg.speculative_algorithm_config is not None:
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+        if not isinstance(algo, CustomSpecAlgo):
+            raise ValueError(
+                "--speculative-algorithm-config is only read by speculative "
+                "algorithms registered via SpeculativeAlgorithm.register, got "
+                f"speculative_algorithm={cfg.speculative_algorithm}."
+            )
+
     if cfg.speculative_skip_dp_mlp_sync:
         assert cfg.speculative_algorithm == "EAGLE", (
             "--speculative-skip-dp-mlp-sync is only supported with "

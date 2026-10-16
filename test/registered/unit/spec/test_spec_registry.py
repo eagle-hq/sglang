@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -222,6 +223,9 @@ class TestServerArgsHook(_RegistryIsolated):
             def handle_server_args(self, server_args):
                 server_args.custom_spec_handle_seen = self.name
                 server_args.speculative_num_draft_tokens = 7
+                server_args.custom_spec_config_seen = (
+                    server_args.speculative_algorithm_config
+                )
 
         @SpeculativeAlgorithm.register(
             "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
@@ -244,6 +248,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_sink_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
+            speculative_algorithm_config='{"k": 1}',
         )
 
         handle_speculative_decoding(server_args)
@@ -253,6 +258,18 @@ class TestServerArgsHook(_RegistryIsolated):
         )
         self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.speculative_num_draft_tokens, 7)
+        self.assertEqual(server_args.custom_spec_config_seen, '{"k": 1}')
+
+    def test_algorithm_config_rejected_without_a_registered_algorithm(self):
+        """Builtins never read --speculative-algorithm-config, so setting it
+        with one (or with no algorithm) must fail instead of being ignored."""
+        for algorithm in ("EAGLE", None):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.speculative_algorithm = algorithm
+                server_args.speculative_algorithm_config = '{"k": 1}'
+                with self.assertRaisesRegex(ValueError, "algorithm-config"):
+                    handle_speculative_decoding(server_args)
 
 
 class TestSubclassOverride(_RegistryIsolated):
