@@ -1495,26 +1495,6 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     return best
 
 
-# Kimi-K3 per-rank dense-GEMM shapes (TP8). They sit in this heuristic's
-# unmeasured region (hidden=7168 inputs fail k > 6144; o_proj-style k=1536
-# fails k < 2048), but TGV wins 1.04-2.43x on every one of them on GB300
-# (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
-# e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
-# small decode batches; larger m stays on the measured heuristic below.
-_K3_TGV_WIN_SHAPES = frozenset(
-    {
-        (6144, 7168),  # KDA fused qkvg
-        (6016, 7168),  # merged MoE front (gate_up | router | latent down)
-        (7168, 1536),  # KDA / MLA o_proj
-        (1536, 7168),  # MLA q_a / shared gate_up
-        (2304, 1536),  # MLA q_b
-        (3584, 7168),  # MoE latent down (unfused fallback)
-        (7168, 3584),  # MoE latent up
-        (7168, 768),  # shared down
-    }
-)
-
-
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
 _MUSE_SPARK_TGV_M_RANGES = {
     (4096, 8192): (1, 16),  # replicated pooler
@@ -1531,9 +1511,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
 
 
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
-    """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
-    graph capture (cold L2). Conservative: ties and unmeasured regions fall
-    back to cuBLAS."""
+    """TGV-vs-cuBLAS (``F.linear``) decision, measured on B300 under CUDA graph
+    capture (cold L2). Conservative: ties and unmeasured regions fall back to
+    cuBLAS."""
     if m <= 0:
         # Empty batch: DP-attention idle groups run a 0-token dummy forward to
         # keep the mlp-sync lockstep. A 0-CTA TGV grid is a driver-level
@@ -1544,7 +1524,11 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
-    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+    if m <= 16 and n >= 1024:
+        # Decode batches only stream the weight, and TGV starts streaming it
+        # while it waits on the previous kernel (PDL): it beat cuBLAS on every
+        # dense decode shape swept (k 512-28672, n 1024-57344), also outside
+        # the k / n bounds below. Narrower n leaves TGV too few CTAs.
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
