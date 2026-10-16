@@ -73,6 +73,10 @@ template <
     bool kFilterSorted = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
+  // Release the dependent launch at entry so the next kernel (e.g. the down
+  // GEMM) can start streaming its weights while this one runs. Its PDL wait
+  // still waits for this whole grid, so only the timing changes.
+  PDLTriggerSecondary<kUsePDL>();
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
   using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
@@ -121,7 +125,6 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   } else {
     device::store_as<vec_t>(params.out, out, output_offset);
   }
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 struct UnaryActivationParams {
