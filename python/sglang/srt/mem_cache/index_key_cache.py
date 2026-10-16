@@ -56,14 +56,43 @@ class IndexKeyCache:
         del self.buffer
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Copy the index-K entries (fp8 key and scales) of token slots
+        ``src_loc`` to ``tgt_loc``. Rows of the buffer are pages, not tokens, so
+        move each token's byte ranges instead of whole rows."""
         if tgt_loc.numel() == 0:
             return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
+        if (
+            index_buf_accessor._use_aiter_preshuffle
+            or self.pool.index_page_size != self.pool.page_size
+        ):
+            raise NotImplementedError(
+                "index-K move on the preshuffled, k-pooled or context-parallel layout"
+            )
+        tgt_bytes = self._token_byte_indices(tgt_loc.view(-1).long())
+        src_bytes = self._token_byte_indices(src_loc.view(-1).long())
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
-            index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            flat = index_k.view(-1)
+            flat[tgt_bytes] = flat[src_bytes]
+
+    def _token_byte_indices(self, loc: torch.Tensor) -> torch.Tensor:
+        """Flat byte offsets of the key and scale bytes of each token slot.
+
+        A page holds ``page_size`` fp8 keys of ``index_head_dim`` bytes,
+        followed by their scales (``index_head_dim // quant_block_size`` fp32
+        values per token)."""
+        pool = self.pool
+        page_size = pool.page_size
+        key_bytes = pool.index_head_dim
+        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
+        page_start = loc // page_size * page_size * (key_bytes + scale_bytes)
+        slot = loc % page_size
+        key_start = page_start + slot * key_bytes
+        scale_start = page_start + page_size * key_bytes + slot * scale_bytes
+        key = key_start[:, None] + torch.arange(key_bytes, device=loc.device)
+        scale = scale_start[:, None] + torch.arange(scale_bytes, device=loc.device)
+        return torch.cat([key, scale], dim=1).view(-1)
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
