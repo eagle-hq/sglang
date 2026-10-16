@@ -248,6 +248,11 @@ class SpeculativeAlgorithm(Enum):
             )
         return None
 
+    def req_to_token_extra_len(self, page_size: int) -> int:
+        """Extra ``req_to_token`` row headroom (tokens) this algorithm needs;
+        builtins are covered by the default headroom."""
+        return 0
+
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
