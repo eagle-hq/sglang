@@ -389,8 +389,15 @@ def _fused_sigmoid_mul_kernel(
     q_ptr=None,
     s_ptr=None,
     QUANT: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
+    if USE_PDL:
+        # Every load follows the wait. Triggering right away lets the next
+        # kernel (the o_proj GEMM) launch and prefetch its weights meanwhile.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     pid_row = tl.program_id(0).to(tl.int64)
     pid_block = tl.program_id(1)
 
@@ -463,6 +470,8 @@ def fused_sigmoid_mul(
         s = torch.empty((num_tokens, 1), dtype=torch.float32, device=q.device)
         kwargs = {"q_ptr": q, "s_ptr": s, "QUANT": True}
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _fused_sigmoid_mul_kernel[grid](
         out,
         attn_output,
@@ -472,8 +481,10 @@ def fused_sigmoid_mul(
         hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
+        USE_PDL=use_pdl,
         num_warps=4,
         **kwargs,
+        **pdl_kwargs,
     )
     return (q, s) if quant else out
 
