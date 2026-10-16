@@ -140,6 +140,13 @@ class CustomSpecAlgo:
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 
+    def req_to_token_extra_len(self, page_size: int) -> int:
+        """Minimum ``req_to_token`` row headroom (tokens) past the context
+        length that this algorithm writes into, e.g. draft / verify slots
+        allocated past ``seq_len``. The row is sized to the max of this and
+        the default headroom, so returning 0 (the default) keeps it."""
+        return 0
+
     def resolve_max_speculative_num_draft_tokens(
         self, server_args: ServerArgs
     ) -> Optional[int]:
