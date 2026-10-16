@@ -104,6 +104,10 @@ def _layer_norm_fwd_1pass_kernel(
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+        # Release the dependent launch now: the next kernel (usually the
+        # out_proj GEMM) can start streaming its weights while this one runs.
+        # Its own gdc_wait still waits for this whole grid to finish.
+        tl.extra.cuda.gdc_launch_dependents()
 
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -204,9 +208,6 @@ def _layer_norm_fwd_1pass_kernel(
     else:
         # Write output
         tl.store(Y_base, y, mask=mask)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @lru_cache
