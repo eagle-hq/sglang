@@ -147,6 +147,9 @@ class EagleVerifyInput(SpecInput):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        return seq_lens_cpu + self.draft_token_num
+
 
 @dataclass
 class EagleDraftInput(SpecInput):
@@ -441,3 +444,7 @@ class EagleDraftExtendInput(SpecInput):
             kind=kind,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
+        # paged_kernel_lens already includes the draft-extend window.
+        return seq_lens_cpu
