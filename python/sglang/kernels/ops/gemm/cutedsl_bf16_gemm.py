@@ -17,15 +17,18 @@ Toggled by ``use_2cta`` in the constructor:
   use_2cta=False -> 1x1 cluster, 1-CTA tcgen05.mma, cta_n in [8, 256] step 8
   use_2cta=True  -> 2x1 cluster, 2-CTA tcgen05.mma, cta_n in [16, 256] step 16
 
-Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
+Warp specialization (8 warps, 256 threads/CTA; warp 3 idle unless L2PF):
   Warp 0    DMA_A   TMA-loads A tiles
   Warp 1    DMA_B   TMA-loads B tiles; PDL griddepcontrol.wait
   Warp 2    MMA     tcgen05.mma into TMEM; owns alloc/dealloc
+  Warp 3    L2PF    (l2_prefetch_tiles > 0 only) L2-prefetches the A k-tiles
+                    beyond the smem ring while DMA_B waits on PDL
   Warps 4-7 EPILOG  TMEM -> RMEM -> bf16 cast -> st.global
 """
 
 from __future__ import annotations
 
+import functools
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -120,6 +123,8 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        l2_prefetch_tiles: int = 0,
+        l2_prefetch_clk_per_cta_tile: int = 1,
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
@@ -131,6 +136,14 @@ class TgvGemmCuteExtKernel:
         self.use_pdl = use_pdl
         self.pdl_launch = pdl_launch if pdl_launch is not None else use_pdl
         self.pdl_count = pdl_count
+        # l2_prefetch_tiles: k-tiles past the smem ring that warp 3
+        # L2-prefetches while DMA_B waits on PDL (0 = off), one every
+        # l2_prefetch_clk_per_cta_tile SM clocks per grid CTA (see
+        # _l2_prefetch_plan). Needs a K-major A and PDL.
+        if l2_prefetch_tiles and (not use_pdl or cta_m % 32 != 0):
+            raise ValueError("TGV L2 prefetch needs use_pdl and cta_m % 32 == 0")
+        self.l2_prefetch_tiles = l2_prefetch_tiles
+        self.l2_prefetch_clk_per_cta_tile = l2_prefetch_clk_per_cta_tile
         # has_bias: when True, kernel reads a (Gemm_M, Gemm_N, Gemm_L):(1,0,0)
         # bias tensor (M-broadcast over N,L), converts it to fp32 in RMEM, and
         # adds it to the accumulator before the bf16 cast. When False, all
@@ -147,7 +160,7 @@ class TgvGemmCuteExtKernel:
             )
 
         # Fixed configuration matching the C++ / DSL kernels.
-        self.threads_per_cta = 256  # 8 warps (warp 3 unused)
+        self.threads_per_cta = 256  # 8 warps (warp 3 unused unless L2 prefetch)
         if use_2cta:
             # 2-CTA cluster along M; joint MMA tile = (cta_m*2, cta_n).
             self.cluster_shape = (2, 1, 1)
@@ -167,6 +180,12 @@ class TgvGemmCuteExtKernel:
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
+            # The L2-prefetch variant gets its own kernel name.
+            + (
+                f"_l2pf{self.l2_prefetch_tiles}x{self.l2_prefetch_clk_per_cta_tile}"
+                if self.l2_prefetch_tiles
+                else ""
+            )
         )
 
     @cute.experimental.jit
@@ -321,10 +340,13 @@ class TgvGemmCuteExtKernel:
         #      and (c) 1-arrival "wake the consumer warp" patterns.
         # Allocated as 1D tensors; .iterator gives a Pointer[Int64] supporting
         # `bar + stage` arithmetic. Arrival counts are in the module docstring.
+        # With L2 prefetch, one extra slot (bar_full + DMA_Stage) is a
+        # 1-arrival "PDL wait released" flag that DMA_B arrives on and the
+        # prefetch warp polls (mbarrier.test_wait; nobody blocks on it).
         bar_full_arr = cute_ext.allocate(
             cutlass.Int64,
             cute.AddressSpace.smem,
-            cute.make_layout(DMA_Stage),
+            cute.make_layout(DMA_Stage + (1 if self.l2_prefetch_tiles else 0)),
             alignment=8,
         )
         bar_empty_arr = cute_ext.allocate(
@@ -364,6 +386,8 @@ class TgvGemmCuteExtKernel:
             with cute.arch.elect_one():
                 for i in range(DMA_Stage):
                     cute.arch.mbarrier_init(bar_full + i, 2 * num_mma_ctas)
+                if cutlass.const_expr(self.l2_prefetch_tiles > 0):
+                    cute.arch.mbarrier_init(bar_full + DMA_Stage, 1)  # DMA_B
                 for i in range(DMA_Stage):
                     cute.arch.mbarrier_init(bar_empty + i, 1)  # MMA tcgen05.commit
                 cute.arch.mbarrier_init(bar_tma_epilog, 32)  # whole DMA_B warp
@@ -440,7 +464,7 @@ class TgvGemmCuteExtKernel:
             # parallel with the cluster barrier latency.
             cute.arch.cluster_wait()
 
-        # ---- Warp dispatch (warp 3 idle, kept for 256-thread parity) ----
+        # ---- Warp dispatch (warp 3 idle unless L2 prefetch; 256-thread parity) ----
         if warp_idx == 0:
             self.dma_a_warp(
                 bar_full,
@@ -477,6 +501,14 @@ class TgvGemmCuteExtKernel:
                 mma_inst_tile_k,
                 k_tile_count,
             )
+        elif warp_idx == 3:
+            if cutlass.const_expr(self.l2_prefetch_tiles > 0):
+                self.l2_prefetch_warp(
+                    mA,
+                    work_tile_info.M_idx * self.cta_m,
+                    work_tile_info.L_idx,
+                    bar_full + DMA_Stage,
+                )
         elif warp_idx >= 4:
             # Epilog tid is 128..255 in the CTA; offset to 0..127 for partition.
             epi_tid = tidx - 128
@@ -593,6 +625,69 @@ class TgvGemmCuteExtKernel:
                 empty_phase = empty_phase ^ 1
 
     # ====================================================================
+    # L2PF WARP (warp 3, only when l2_prefetch_tiles > 0) — L2-prefetches
+    # this CTA's A k-tiles [DMA_Stage, DMA_Stage + l2_prefetch_tiles) while
+    # the PDL wait blocks.
+    #
+    # DMA_A streams A (weights) before the PDL wait, but only DMA_Stage
+    # k-tiles fit in the smem ring; the rest used to stream from HBM after
+    # the wait. If the preceding kernel is latency-bound (all-reduce,
+    # act_and_mul, ...), HBM idles meanwhile, so we pull those tiles into
+    # L2 and the post-wait refills hit L2.
+    #
+    # - prefetch.global.L2, one 128 B line per lane per row, k-tile by
+    #   k-tile (the order DMA_A will consume them).
+    # - Starts after an estimate of the ring's own fill time and is paced so
+    #   the whole grid issues at about the HBM rate (grid_ctas *
+    #   l2_prefetch_clk_per_cta_tile clocks per tile per CTA).
+    #   Unpaced prefetches issued while HBM is still busy (the previous
+    #   GEMM's tail, back-to-back GEMMs, a short predecessor) were measured
+    #   to slow the GEMM down instead.
+    # - Stops as soon as DMA_B passes griddepcontrol.wait (bar_released):
+    #   from then on the refill TMA loads fetch the data themselves.
+    # Prefetches only move bytes into L2; results are unchanged.
+    # ====================================================================
+    @cute.experimental.jit
+    def l2_prefetch_warp(
+        self,
+        mA: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L), K-major
+        m_base: cutlass.Int32,  # first A row of this CTA
+        l_idx: cutlass.Int32,
+        bar_released,  # Pointer[Int64], 1-arrival, arrived by DMA_B
+    ):
+        DMA_Stage = self.num_ab_stage
+        lane = cute.arch.lane_idx()
+        gemm_m = cute.size(mA, mode=[0])
+        gemm_k = cute.size(mA, mode=[1])
+        k_lo = DMA_Stage * self.cta_k
+        k_hi = k_lo + self.l2_prefetch_tiles * self.cta_k
+        if k_hi > gemm_k:
+            k_hi = gemm_k
+        if k_hi > k_lo:
+            gx, gy, gz = cute.arch.grid_dim()
+            interval = cutlass.Int64(gx * gy * gz * self.l2_prefetch_clk_per_cta_tile)
+            t_next = cute.arch.clock64() + interval * DMA_Stage
+            go = cutlass.Boolean(True)
+            for k0 in cutlass.range(k_lo, k_hi, self.cta_k, unroll=1):
+                while go and cute.arch.clock64() < t_next:
+                    if cute.arch.mbarrier_test_wait(bar_released, 0):
+                        go = cutlass.Boolean(False)
+                t_next = t_next + interval
+                if go:
+                    if cute.arch.mbarrier_test_wait(bar_released, 0):
+                        go = cutlass.Boolean(False)
+                if go:
+                    for i in cutlass.range_constexpr(self.cta_m // 32):
+                        m = m_base + i * 32 + lane
+                        if m < gemm_m:
+                            # 128 B lines = 64 bf16 along K.
+                            for j in cutlass.range_constexpr(self.cta_k // 64):
+                                kk = k0 + j * 64
+                                if kk < gemm_k:
+                                    ptr = mA[m, None, l_idx].iterator + kk
+                                    cute.arch.prefetch(ptr.llvm_ptr, cache_level="L2")
+
+    # ====================================================================
     # DMA_B WARP — same as DMA_A but for B; also drives the PDL
     # griddepcontrol.wait and signals the epilog when all activation loads
     # are issued.
@@ -617,6 +712,10 @@ class TgvGemmCuteExtKernel:
         # is weights (already resident), so DMA_A doesn't need this.
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
+        # Tell the L2 prefetch warp the wait is over (it stops).
+        if cutlass.const_expr(self.l2_prefetch_tiles > 0):
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(bar_full + DMA_Stage)
 
         # See dma_a_warp for empty_phase + fused arrive-and-expect-tx logic.
         empty_phase = cutlass.Int32(1)
@@ -1110,6 +1209,8 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    l2_prefetch_tiles: int = 0,
+    l2_prefetch_clk_per_cta_tile: int = 1,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1131,6 +1232,8 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        int(l2_prefetch_tiles),
+        int(l2_prefetch_clk_per_cta_tile),
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1156,6 +1259,8 @@ def _get_compiled_cute_ext_kernel(
         use_pdl=use_pdl,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
+        l2_prefetch_tiles=l2_prefetch_tiles,
+        l2_prefetch_clk_per_cta_tile=l2_prefetch_clk_per_cta_tile,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1248,6 +1353,48 @@ def _to_cute_swap(
     return a_, b_, c_, bias_, layout
 
 
+@functools.cache
+def _l2_prefetch_budget(device_index: int) -> Tuple[int, int]:
+    """(bytes per CTA, bytes per SM clock) for the weight L2 prefetch on a GPU.
+
+    The window is half of L2 split over one CTA per SM, so the prefetched
+    weights leave room for everything else; the grid issues prefetches at the
+    peak memory rate. (0, 0) when the device does not report its clocks.
+    """
+    props = torch.cuda.get_device_properties(device_index)
+    # kHz x bus bits -> bytes per second; discrete GPUs report the physical
+    # memory clock of a double-data-rate bus (see fa4_sm120.runtime).
+    data_rate = 1 if getattr(props, "is_integrated", False) else 2
+    memory_bits_per_khz = data_rate * props.memory_clock_rate * props.memory_bus_width
+    bytes_per_clk = (
+        memory_bits_per_khz // 8 // props.clock_rate if props.clock_rate else 0
+    )
+    if not bytes_per_clk:
+        return 0, 0
+    return props.L2_cache_size // 2 // props.multi_processor_count, bytes_per_clk
+
+
+def _l2_prefetch_plan(
+    *,
+    budget: Tuple[int, int],
+    pdl: bool,
+    k_major: bool,
+    k: int,
+    cta_m: int,
+    num_ab_stage: int,
+) -> Tuple[int, int]:
+    """(weight k-tiles past the smem ring to L2-prefetch per CTA, SM clocks per
+    grid CTA between two of them, rounded up so the grid never issues faster
+    than the memory rate); (0, 1) = no prefetch. Needs PDL (the prefetch runs
+    during the wait), a K-major weight and K beyond the ring."""
+    bytes_per_cta, bytes_per_clk = budget
+    tile_bytes = cta_m * _TGV_CUTE_EXT_CTA_K * 2
+    tiles = bytes_per_cta // tile_bytes
+    if not (pdl and k_major and k > num_ab_stage * _TGV_CUTE_EXT_CTA_K and tiles):
+        return 0, 1
+    return tiles, -(-tile_bytes // bytes_per_clk)
+
+
 def _resolve_tactic(tactic: int) -> Tuple[int, int, int, bool]:
     """Return (cta_m, cta_n, num_ab_stage, use_2cta) for the given tactic id."""
     if tactic < 0:
@@ -1266,8 +1413,12 @@ def _run_tgv(
     out: torch.Tensor,
     pdl: bool,
     tactic: int,
+    l2_prefetch: bool = True,
 ) -> torch.Tensor:
-    """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
+    """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,).
+
+    ``l2_prefetch=False`` runs the kernel without the weight L2 prefetch.
+    """
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
 
@@ -1276,6 +1427,15 @@ def _run_tgv(
         b,
         out,
         bias,
+    )
+
+    l2_prefetch_tiles, l2_prefetch_clk_per_cta_tile = _l2_prefetch_plan(
+        budget=_l2_prefetch_budget(a.device.index) if l2_prefetch else (0, 0),
+        pdl=pdl,
+        k_major=a_leading == 2,
+        k=a.shape[-1],
+        cta_m=cta_m,
+        num_ab_stage=num_ab_stage,
     )
 
     compiled = _get_compiled_cute_ext_kernel(
@@ -1291,6 +1451,8 @@ def _run_tgv(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        l2_prefetch_tiles=l2_prefetch_tiles,
+        l2_prefetch_clk_per_cta_tile=l2_prefetch_clk_per_cta_tile,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1333,26 +1495,6 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     return best
 
 
-# Kimi-K3 per-rank dense-GEMM shapes (TP8). They sit in this heuristic's
-# unmeasured region (hidden=7168 inputs fail k > 6144; o_proj-style k=1536
-# fails k < 2048), but TGV wins 1.04-2.43x on every one of them on GB300
-# (L2-defeating weight rotation + CUDA-graph timing; serving A/B confirmed
-# e2e with GSM8K parity). kv_a (n=576) loses (0.84x) and stays out. Gated to
-# small decode batches; larger m stays on the measured heuristic below.
-_K3_TGV_WIN_SHAPES = frozenset(
-    {
-        (6144, 7168),  # KDA fused qkvg
-        (6016, 7168),  # merged MoE front (gate_up | router | latent down)
-        (7168, 1536),  # KDA / MLA o_proj
-        (1536, 7168),  # MLA q_a / shared gate_up
-        (2304, 1536),  # MLA q_b
-        (3584, 7168),  # MoE latent down (unfused fallback)
-        (7168, 3584),  # MoE latent up
-        (7168, 768),  # shared down
-    }
-)
-
-
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
 _MUSE_SPARK_TGV_M_RANGES = {
     (4096, 8192): (1, 16),  # replicated pooler
@@ -1369,9 +1511,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
 
 
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
-    """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
-    graph capture (cold L2). Conservative: ties and unmeasured regions fall
-    back to cuBLAS."""
+    """TGV-vs-cuBLAS (``F.linear``) decision, measured on B300 under CUDA graph
+    capture (cold L2). Conservative: ties and unmeasured regions fall back to
+    cuBLAS."""
     if m <= 0:
         # Empty batch: DP-attention idle groups run a 0-token dummy forward to
         # keep the mlp-sync lockstep. A 0-CTA TGV grid is a driver-level
@@ -1382,7 +1524,10 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
-    if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+    if m <= 16 and n >= 1024:
+        # Decode batches are weight-bandwidth bound, and TGV loads its weight
+        # tiles while it waits on the previous kernel (PDL): it beat cuBLAS on
+        # every dense decode shape swept (k 512-28672, n 1024-57344).
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False

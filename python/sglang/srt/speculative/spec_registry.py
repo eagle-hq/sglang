@@ -4,6 +4,7 @@ should use that classmethod API; do not import from this module directly.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
@@ -115,6 +116,34 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def need_topk(self) -> bool:
+        """Whether the decode relay carries the draft top-k (``topk_p`` /
+        ``topk_index``). Follows ``is_eagle()`` like the builtins."""
+        return self.is_eagle() or self.is_standalone()
+
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states. Follows ``is_eagle()`` like the builtins."""
+        return self.is_eagle()
+
+    def create_future_map(
+        self,
+        device: torch.device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
+    ) -> FutureMap:
+        """The scheduler's step-to-step relay (always on, overlap or not)."""
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 
@@ -198,7 +227,7 @@ def _reserved_names() -> frozenset:
 
 def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     """Fail fast if ``spec_class`` drifts from the ``SpeculativeAlgorithm``
-    duck-typing contract.
+    duck-typing contract (every public instance method of the enum).
 
     ``from_string`` returns either type and callers dispatch on the shared
     ``is_*()`` / ``supports_*()`` interface without isinstance checks, so every
@@ -217,10 +246,12 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     # empty interface and turn this guard into a silent no-op.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+    # Every public instance method: the scheduler and model runner call more
+    # than the predicates (e.g. ``create_future_map`` at scheduler init).
     interface = {
         name
-        for name in vars(SpeculativeAlgorithm)
-        if name.startswith(("is_", "supports_"))
+        for name, value in vars(SpeculativeAlgorithm).items()
+        if not name.startswith("_") and inspect.isfunction(value)
     }
     missing = sorted(interface - set(dir(spec_class)))
     if missing:
