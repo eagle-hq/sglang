@@ -1124,9 +1124,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         batch.reqs,
         reserve=double_alloc,
         page_size=page_size,
+        free_tokens=batch.token_to_kv_pool_allocator.available_size(),
+        row_len=batch.req_to_token_pool.req_to_token.shape[1],
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+    if num_needed_tokens == 0:
+        # Every request still holds its reserve: no host tensors, copies or launches.
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
