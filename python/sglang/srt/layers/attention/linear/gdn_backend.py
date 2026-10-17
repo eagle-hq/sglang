@@ -621,6 +621,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if self.verify_extension is not None:
             self._begin_verify_extension(forward_batch, in_graph=False)
 
+    def target_verify_takes_projection_views(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.forward_mode.is_target_verify()
+            and self._verify_extension_layout is not None
+            and self.verify_extension.reads_strided_inputs()
+        )
+
     def _begin_verify_extension(self, forward_batch: ForwardBatch, *, in_graph: bool):
         metadata = self.forward_metadata
         layout = None
@@ -1156,10 +1163,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            # The recurrence reads strided q/k/v: an extension's answer for the
+            # forwards it handles, main's strided-QKV routing for the rest.
             and not (
-                # An extension is handed contiguous q/k/v.
-                self._use_strided_target_verify_qkv
-                and self._verify_extension_layout is None
+                self.verify_extension.reads_strided_inputs()
+                if self._verify_extension_layout is not None
+                else self._use_strided_target_verify_qkv
             )
         ):
             query, key, value = fused_qkv_split_gdn_prefill(

@@ -59,6 +59,13 @@ _validate_mamba_replay_state_indices = (
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
 
+    def target_verify_takes_projection_views(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this forward is a target verify whose conv and recurrence
+        take token-strided views of a layer's input projection, so the layer
+        may skip splitting it into copies. The builtin verify kernels take the
+        copies (False); a verify extension may say otherwise."""
+        return False
+
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
         if server_args.enable_mis and not cls.supports_mis:

@@ -999,13 +999,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
         use_strided_prefill_z = False
-        packed_verify = False
+        packed_verify = strided_verify = False
         if forward_batch.forward_mode.is_target_verify():
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
+            takes_views = getattr(backend, "target_verify_takes_projection_views", None)
+            strided_verify = takes_views is not None and takes_views(forward_batch)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
             and (forward_batch.forward_mode.is_decode() or packed_verify)
@@ -1029,8 +1031,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+            use_strided_prefill_z = _is_cuda and (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or strided_verify
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
