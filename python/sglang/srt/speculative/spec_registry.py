@@ -12,6 +12,10 @@ import torch
 from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.verify_extension import (
+        LinearAttnStateLayout,
+        LinearAttnVerifyExtension,
+    )
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.runner.decode_graph_variants import (
@@ -132,6 +136,16 @@ class CustomSpecAlgo:
         which (``is_draft_worker``, ``capture_forward_mode``), the widest
         verify it fits and its device. ``None`` (the default) keeps one graph
         per batch size at the static width."""
+        return None
+
+    def create_linear_attn_verify_extension(
+        self, state: LinearAttnStateLayout
+    ) -> Optional[LinearAttnVerifyExtension]:
+        """Target-verify extension for a GDN linear-attention backend with
+        this ``state`` (see ``layers/attention/linear/verify_extension.py``):
+        replace the verify conv1d and recurrence with your own kernels, for
+        example a verify over a non-chain draft layout. Called once per GDN
+        backend. ``None`` (the default) keeps the backend's kernels."""
         return None
 
     def resolve_max_speculative_num_draft_tokens(
