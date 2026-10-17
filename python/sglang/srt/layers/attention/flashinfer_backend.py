@@ -14,6 +14,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -81,6 +82,13 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+
+    # A FlashInfer whose forward() takes `out` writes into a caller's output
+    # instead of a zero-filled one (no release has it yet).
+    _PAGED_PREFILL_FORWARD_TAKES_OUT = (
+        "out"
+        in inspect.signature(BatchPrefillWithPagedKVCacheWrapper.forward).parameters
+    )
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
@@ -1373,8 +1381,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            # A target verify on fa2 writes every output row (each request's qo
+            # range covers its draft tokens), so the zero fill can be skipped.
+            out = None
+            if (
+                _PAGED_PREFILL_FORWARD_TAKES_OUT
+                and forward_batch.forward_mode.is_target_verify()
+                and self.prefill_backend == "fa2"
+            ):
+                out = torch.empty_like(q)
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                q,
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
@@ -1396,6 +1414,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
+                **({} if out is None else {"out": out}),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
