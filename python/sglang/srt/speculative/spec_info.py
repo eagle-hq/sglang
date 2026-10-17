@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -23,6 +24,16 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.layers.attention.linear.verify_extension import (
+        LinearAttnStateLayout,
+        LinearAttnVerifyExtension,
+    )
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphVariants,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -253,6 +264,20 @@ class SpeculativeAlgorithm(Enum):
         builtins are covered by the default headroom."""
         return 0
 
+    def create_decode_graph_variants(
+        self, runner: DecodeCudaGraphRunner
+    ) -> Optional[DecodeGraphVariants]:
+        """Extra CUDA-graph variants for ``runner``; builtins capture one
+        graph per batch size at the static width."""
+        return None
+
+    def create_linear_attn_verify_extension(
+        self, state: LinearAttnStateLayout
+    ) -> Optional[LinearAttnVerifyExtension]:
+        """Target-verify extension for a GDN linear-attention backend;
+        builtins run the backend's own verify kernels."""
+        return None
+
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
@@ -406,6 +431,20 @@ class SpecInputType(IntEnum):
     PP_SPEC_RELAY = auto()
 
 
+@dataclasses.dataclass(frozen=True)
+class FlashInferVerifyVariant:
+    """A custom FlashInfer attention variant for target-verify prefill
+    wrappers, built through FlashInfer's public JIT API:
+    ``BatchPrefillWithPagedKVCacheWrapper(jit_args=jit_args,
+    custom_mask_buf=mask_buf, variant_owns_mask=True)`` on the fa2 backend."""
+
+    # Arguments of flashinfer.jit.gen_customize_batch_prefill_module.
+    jit_args: Tuple[Any, ...]
+    # The wrappers' custom_mask_buf, which the variant reads as
+    # maybe_custom_mask; its owner fills it before each replay.
+    mask_buf: torch.Tensor
+
+
 class SpecInput(ABC):
     # Whether this input carries all state required for CUDA graph replay.
     # Algorithm-specific dataclass subclasses can override this per input.
@@ -435,6 +474,15 @@ class SpecInput(ABC):
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+    # Whether a forward carrying this input reads only the greedy argmax of
+    # its rows (an all-greedy verify without logprobs, grammar or penalties).
+    # The logits processor then returns LogitsProcessorOutput.next_token_ids
+    # and leaves next_token_logits None, so nothing can read logits that were
+    # never gathered. Where it cannot compute ids that way it returns logits
+    # as usual, so a consumer must accept both. Class-level default (same
+    # rationale as ragged_verify_layout).
+    greedy_tokens_only: bool = False
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
@@ -466,6 +514,32 @@ class SpecInput(ABC):
         pad_tensor_to_size: Callable[..., torch.Tensor],
         batch_size: int,
     ) -> None:
+        return None
+
+    def flashinfer_verify_variant(
+        self,
+        bs: int,
+        num_tokens: int,
+        *,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        head_dim: int,
+    ) -> Optional[FlashInferVerifyVariant]:
+        """Called by the FlashInfer backend when it creates the target-verify
+        CUDA-graph wrappers of a (bs, num_tokens) graph under capture, with
+        their query and KV-cache dtypes and head dim. Return a
+        FlashInferVerifyVariant to build them with that attention variant
+        instead of the default custom-mask kernel; None (default) keeps the
+        default. The variant computes the mask itself, so these wrappers are
+        planned without one."""
+        return None
+
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> Optional[torch.Tensor]:
+        """Host copy of the per-request KV lengths this input's
+        generate_attn_arg_prefill lays out, from the batch's host
+        ``seq_lens_cpu``. None (default) when they are not known on the host.
+        Lets the attention backend plan a CUDA-graph replay without reading
+        the layout back from the device."""
         return None
 
 
