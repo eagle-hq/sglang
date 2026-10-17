@@ -59,6 +59,12 @@ _validate_mamba_replay_state_indices = (
 class MambaAttnBackendBase(AttentionBackend):
     supports_mis: bool = False
 
+    def target_verify_reads_strided_inputs(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this forward is a target verify whose conv and recurrence
+        take token-strided inputs, so a layer may hand them views of its input
+        projection instead of split copies."""
+        return False
+
     @classmethod
     def validate_mis_support(cls, server_args) -> None:
         if server_args.enable_mis and not cls.supports_mis:
