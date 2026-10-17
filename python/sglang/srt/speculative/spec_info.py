@@ -411,6 +411,15 @@ class SpecInput(ABC):
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
+    # Whether a forward carrying this input reads only the greedy argmax of
+    # its rows (an all-greedy verify without logprobs, grammar or penalties).
+    # The logits processor then returns LogitsProcessorOutput.next_token_ids
+    # and leaves next_token_logits None, so nothing can read logits that were
+    # never gathered. Where it cannot compute ids that way it returns logits
+    # as usual, so a consumer must accept both. Class-level default (same
+    # rationale as ragged_verify_layout).
+    greedy_tokens_only: bool = False
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
