@@ -21,13 +21,13 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.layers.attention.linear.verify_extension import (
         LinearAttnStateLayout,
         LinearAttnVerifyExtension,
     )
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
