@@ -1,6 +1,6 @@
 ---
 title: "Add an out-of-tree speculative algorithm"
-description: "Register a speculative decoding algorithm from a plugin package and use the scheduler hooks it can override."
+description: "Register a speculative decoding algorithm from a plugin package and use the scheduler and verify hooks it can override."
 ---
 
 A speculative algorithm plugin adds a new `--speculative-algorithm` value without changing SGLang. The plugin registers the algorithm by name, returns its worker class, and overrides the hooks below. Every hook defaults to the builtin behavior, so builtin algorithms behave the same whether or not a plugin is installed.
@@ -39,6 +39,25 @@ Override these on the `CustomSpecAlgo` subclass passed as `spec_class`. Builtin 
 | `supports_mm_inputs(self) -> bool` | `True` | By the default `validate_request`, and by the server warmup, which sends a text-only request when this is `False`. |
 | `validate_request(self, req, *, has_mm_inputs: bool, enable_overlap: bool) -> Optional[str]` | Rejects multimodal requests when `supports_mm_inputs()` is `False`; otherwise `None` | Once per request on admission. A returned message aborts the request with it. `has_mm_inputs` reports images, audio or video, which `req` does not hold yet. Call `super().validate_request(...)` from an override to keep the multimodal check. |
 | `req_to_token_extra_len(self, page_size: int) -> int` | `0` | When the `req_to_token` pool is sized at startup. The row for each request gets at least this many slots past the context length, so an algorithm that writes draft or verify slots past `seq_len` cannot spill into the next request's row. It can only raise the default headroom. |
+
+## Verify hooks
+
+These let an algorithm change how the target model runs its verify forward. All default to the builtin behavior.
+
+On the `CustomSpecAlgo` subclass:
+
+| Hook | Default | Called |
+|---|---|---|
+| `create_decode_graph_variants(self, runner) -> Optional[DecodeGraphVariants]` | `None`: one graph per batch size at the static width | Once per decode / target-verify CUDA-graph runner, target and draft alike. A `DecodeGraphVariants` (`model_executor/runner/decode_graph_variants.py`) gives the graphs an extra axis, for example one target-verify graph per verify width: `capture_variants(bs)` lists the variants captured at each batch size, `replay_variant(forward_batch)` picks the graph of a step (asked once per step; `None` runs eagerly). |
+| `create_linear_attn_verify_extension(self, state: LinearAttnStateLayout) -> Optional[LinearAttnVerifyExtension]` | `None`: the backend's kernels | Once per GDN linear-attention backend. A `LinearAttnVerifyExtension` (`layers/attention/linear/verify_extension.py`) replaces the target-verify conv1d (`conv_update`) and gated delta recurrence (`recurrent_update`) for the verifies it gets a `LinearAttnVerifyLayout` for in `begin_forward(layout, in_graph=...)`, for example a verify over a tree-shaped draft. `reads_strided_inputs()` lets it take views of the input projection instead of split copies. |
+
+On the verify input (a `SpecInput` subclass, for example of `EagleVerifyInput`):
+
+| Hook | Default | Effect |
+|---|---|---|
+| `greedy_tokens_only: bool` | `False` | `True`: the forward needs only each verify row's greedy token. The logits processor then returns `LogitsProcessorOutput.next_token_ids` (the argmax, computed on the vocab-parallel LM-head output without gathering the logits) and `next_token_logits=None`. Where it cannot (DP attention, logit soft-capping) it returns the logits as usual, so read `next_token_ids` first and fall back to the logits. A CUDA graph captured with such an input replays it. |
+| `attn_kv_lens_cpu(self, seq_lens_cpu) -> Optional[torch.Tensor]` | `None`; EAGLE, NGRAM and DFLASH inputs implement it | Host copy of the KV lengths `generate_attn_arg_prefill` lays out. When it is known, the FlashInfer backend plans target-verify graph replays without copying the layout back from the GPU. |
+| `flashinfer_verify_variant(self, bs, num_tokens, *, q_dtype, kv_dtype, head_dim) -> Optional[FlashInferVerifyVariant]` | `None`: the builtin custom-mask attention | When the FlashInfer backend creates the target-verify wrappers of a captured graph. A `FlashInferVerifyVariant(jit_args, mask_buf)` builds them with FlashInfer's public `jit_args`, `custom_mask_buf=mask_buf` and `variant_owns_mask=True` (fa2 backend); the variant reads `mask_buf`, which its owner fills before each replay. |
 
 ## Algorithm configuration
 
