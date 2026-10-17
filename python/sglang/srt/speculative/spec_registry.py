@@ -14,6 +14,12 @@ from sglang.srt.arg_groups.overrides import resolving_view
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+    from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphVariants,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -117,6 +123,17 @@ class CustomSpecAlgo:
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
+
+    def create_decode_graph_variants(
+        self, runner: DecodeCudaGraphRunner
+    ) -> Optional[DecodeGraphVariants]:
+        """Extra CUDA-graph variants for a decode / target-verify ``runner``
+        (see ``model_executor/runner/decode_graph_variants.py``), for example
+        one target-verify graph per verify width. Called once per runner,
+        target and draft alike; check ``runner.model_runner.is_draft_worker``
+        and ``runner.capture_forward_mode``. ``None`` (the default) keeps one
+        graph per batch size at the static width."""
+        return None
 
     def resolve_max_speculative_num_draft_tokens(
         self, server_args: ServerArgs
