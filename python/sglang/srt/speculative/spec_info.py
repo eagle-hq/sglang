@@ -23,6 +23,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphRunnerInfo,
+        DecodeGraphVariants,
+    )
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -226,6 +230,13 @@ class SpeculativeAlgorithm(Enum):
             return build_dflash_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        return None
+
+    def create_decode_graph_variants(
+        self, info: DecodeGraphRunnerInfo
+    ) -> Optional[DecodeGraphVariants]:
+        """Extra CUDA-graph variants for the runner ``info`` describes;
+        builtins capture one graph per batch size at the static width."""
         return None
 
     def need_topk(self) -> bool:
