@@ -16,6 +16,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -46,7 +47,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    FlashInferVerifyVariant,
+    SpecInput,
+    SpecInputType,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -553,6 +558,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # speculative graph variants captures several verify widths per bs,
         # and each graph keeps the wrappers it was captured with.
         self.target_verify_cuda_graph_wrappers = {}
+        # Wrappers built with a speculative input's attention variant, which
+        # computes the mask itself (SpecInput.flashinfer_verify_variant).
+        self.variant_mask_wrappers = weakref.WeakSet()
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
@@ -856,7 +864,12 @@ class FlashInferAttnBackend(AttentionBackend):
             and seq_lens_cpu is not None
             and spec_info.attn_kv_lens_cpu(seq_lens_cpu[:bs]) is not None
             # A packed mask's size is host-known for one request only.
-            and (getattr(spec_info, "custom_mask", None) is None or bs == 1)
+            and (
+                getattr(spec_info, "custom_mask", None) is None
+                or bs == 1
+                or self.target_verify_cuda_graph_wrappers[(bs, num_tokens)][0]
+                in self.variant_mask_wrappers
+            )
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
@@ -1142,7 +1155,12 @@ class FlashInferAttnBackend(AttentionBackend):
             wrappers = self.decode_cuda_graph_metadata[bs]
         return wrappers
 
-    def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
+    def _create_prefill_wrappers(
+        self,
+        bs: int,
+        use_custom_mask: bool = False,
+        variant: Optional[FlashInferVerifyVariant] = None,
+    ) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
         # `custom_mask_buf` is initialized (not whether a custom mask is provided).
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
@@ -1158,6 +1176,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 if use_custom_mask
                 else {}
             )
+            if variant is not None:
+                assert self.prefill_backend == "fa2" and self.num_wrappers == 1, (
+                    "attention variants are supported on one fa2 wrapper"
+                )
+                extra = {
+                    "custom_mask_buf": variant.mask_buf,
+                    "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    "jit_args": list(variant.jit_args),
+                    "variant_owns_mask": True,
+                }
             wrappers.append(
                 BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -1171,6 +1199,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     **extra,
                 )
             )
+        if variant is not None:
+            self.variant_mask_wrappers.update(wrappers)
         return wrappers
 
     @staticmethod
@@ -1300,7 +1330,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+            variant = (
+                spec_info.flashinfer_verify_variant(
+                    bs,
+                    num_tokens,
+                    q_dtype=self.indices_updater_prefill.q_data_type,
+                    kv_dtype=self.indices_updater_prefill.data_type,
+                    head_dim=self.indices_updater_prefill.head_dim,
+                )
+                if forward_mode.is_target_verify() and spec_info is not None
+                else None
+            )
+            prefill_wrappers = self._create_prefill_wrappers(
+                bs, use_custom_mask, variant
+            )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             if forward_mode.is_target_verify():
                 self.target_verify_cuda_graph_wrappers[(bs, num_tokens)] = (
@@ -2297,8 +2340,13 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = multi_item_params.token_pos_in_items_len
             max_item_len_ptr = multi_item_params.max_item_len_ptr
         else:
-            # No multi-item scoring - use standard parameters
-            use_custom_mask = custom_mask
+            # No multi-item scoring - use standard parameters. An attention
+            # variant computes the mask itself.
+            use_custom_mask = (
+                None
+                if wrapper_paged in self.attn_backend.variant_mask_wrappers
+                else custom_mask
+            )
             prefix_len_ptr = None
             token_pos_in_items_ptr = None
             token_pos_in_items_len = 0
@@ -2312,6 +2360,7 @@ class FlashInferIndicesUpdaterPrefill:
             and use_custom_mask is None
             and wrapper_paged.is_cuda_graph_enabled
             and wrapper_paged._custom_mask_buf is not None
+            and wrapper_paged not in self.attn_backend.variant_mask_wrappers
         ):
             raise RuntimeError(
                 f"{spec_info.spec_input_type} verify planned without a custom mask on "
