@@ -21,6 +21,10 @@ from sglang.srt.speculative.spec_registry import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.verify_extension import (
+        LinearAttnStateLayout,
+        LinearAttnVerifyExtension,
+    )
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -240,6 +244,13 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[DecodeGraphVariants]:
         """Extra CUDA-graph variants for ``runner``; builtins capture one
         graph per batch size at the static width."""
+        return None
+
+    def create_linear_attn_verify_extension(
+        self, state: LinearAttnStateLayout
+    ) -> Optional[LinearAttnVerifyExtension]:
+        """Target-verify extension for a GDN linear-attention backend;
+        builtins run the backend's own verify kernels."""
         return None
 
     def need_topk(self) -> bool:
