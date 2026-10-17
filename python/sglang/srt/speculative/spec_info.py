@@ -465,6 +465,14 @@ class SpecInput(ABC):
     ) -> None:
         return None
 
+    def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> Optional[torch.Tensor]:
+        """Host copy of the per-request KV lengths this input's
+        generate_attn_arg_prefill lays out, from the batch's host
+        ``seq_lens_cpu``. None (default) when they are not known on the host.
+        Lets the attention backend plan a CUDA-graph replay without reading
+        the layout back from the device."""
+        return None
+
 
 def spec_scale_global_num_tokens(
     spec_info: SpecInput,
