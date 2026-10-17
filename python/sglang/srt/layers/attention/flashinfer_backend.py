@@ -541,6 +541,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+        # Target-verify graph wrappers by (bs, num_tokens): a runner with
+        # speculative graph variants captures several verify widths per bs,
+        # and each graph keeps the wrappers it was captured with.
+        self.target_verify_cuda_graph_wrappers = {}
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
@@ -760,7 +764,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.target_verify_cuda_graph_wrappers.get(
+                    (bs, forward_batch.positions.numel()),
+                    self.prefill_cuda_graph_metadata[bs],
+                ),
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -857,8 +864,8 @@ class FlashInferAttnBackend(AttentionBackend):
             # replay that otherwise stall the CPU behind the in-flight graph.
             # EAGLE target-verify keeps the plain plan(): its spec input is
             # not DFLASH_VERIFY, and this branch keys off the capture-time
-            # spec_info of these per-bs wrappers.
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            # spec_info of these wrappers.
+            for w in self.target_verify_cuda_graph_wrappers[(bs, num_tokens)]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1291,6 +1298,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if forward_mode.is_target_verify():
+                self.target_verify_cuda_graph_wrappers[(bs, num_tokens)] = (
+                    prefill_wrappers
+                )
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
