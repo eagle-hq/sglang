@@ -1,0 +1,63 @@
+---
+title: "Add an out-of-tree speculative algorithm"
+description: "Register a speculative decoding algorithm from a plugin package and use the scheduler hooks it can override."
+---
+
+A speculative algorithm plugin adds a new `--speculative-algorithm` value without changing SGLang. The plugin registers the algorithm by name, returns its worker class, and overrides the hooks below. Every hook defaults to the builtin behavior, so builtin algorithms behave the same whether or not a plugin is installed.
+
+## Register the algorithm
+
+Register the algorithm from a general plugin entry point (group `sglang.srt.plugins`, see [Plugin Type 2: General Plugin](/docs/hardware-platforms/plugin#plugin-type-2-general-plugin)). `load_plugins()` runs it in every SGLang process before server arguments are resolved.
+
+```python
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+class MySpecAlgo(CustomSpecAlgo):
+    """Override algorithm-level hooks here."""
+
+def register():
+    @SpeculativeAlgorithm.register("MY_SPEC", spec_class=MySpecAlgo)
+    def _factory(server_args):
+        from my_package.worker import MySpecWorker  # a BaseSpecWorker subclass
+
+        return MySpecWorker
+```
+
+Start the server with `--speculative-algorithm MY_SPEC`.
+
+The worker class subclasses `BaseSpecWorker`. Its scheduler-facing methods (`forward_batch_generation`, `note_request_finished`, `on_verify_complete_cpu`, `activate_step_by_batch`) are the worker side of the contract.
+
+An algorithm that keeps EAGLE's draft model, draft KV pool and prefill can subclass `EAGLEWorkerV2` instead. Override `create_draft_worker(self, server_args, gpu_id, nccl_port, target_worker)` to return an `EagleDraftWorker` subclass; `EAGLEWorkerV2.__init__` calls it on the last pipeline stage only. On the draft worker, `init_attention_backend()` creates the draft attention backends and `_capture_cuda_graphs()` captures the draft graphs; both run inside the draft's TP and MoE contexts.
+
+## Algorithm hooks
+
+Override these on the `CustomSpecAlgo` subclass passed as `spec_class`. Builtin algorithms implement the same methods, so the scheduler calls them without type checks.
+
+| Hook | Default | Called |
+|---|---|---|
+| `supports_mm_inputs(self) -> bool` | `True` | By the default `validate_request`, and by the server warmup, which sends a text-only request when this is `False`. |
+| `validate_request(self, req, *, has_mm_inputs: bool, enable_overlap: bool) -> Optional[str]` | Rejects multimodal requests when `supports_mm_inputs()` is `False`; otherwise `None` | Once per request on admission. A returned message aborts the request with it. `has_mm_inputs` reports images, audio or video, which `req` does not hold yet. Call `super().validate_request(...)` from an override to keep the multimodal check. |
+| `req_to_token_extra_len(self, page_size: int) -> int` | `0` | When the `req_to_token` pool is sized at startup. The row for each request gets at least this many slots past the context length, so an algorithm that writes draft or verify slots past `seq_len` cannot spill into the next request's row. It can only raise the default headroom. |
+
+## Algorithm configuration
+
+Pass algorithm-specific settings with `--speculative-algorithm-config`. SGLang does not parse the value; your algorithm defines the format, for example a JSON string or a path to a JSON file. SGLang rejects the flag when the selected algorithm is a builtin or none is selected.
+
+Read it during argument resolution from `handle_server_args` or `validate_server_args`, and at runtime from the speculative config:
+
+```python
+import json
+
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.runtime_context import get_spec
+
+class MySpecAlgo(CustomSpecAlgo):
+    def handle_server_args(self, server_args):
+        raw = resolving_view(server_args).speculative_algorithm_config
+        config = json.loads(raw) if raw else {}
+        ...
+
+# In the worker, after startup:
+raw = get_spec().speculative_algorithm_config
+```

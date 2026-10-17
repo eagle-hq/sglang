@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -112,6 +112,28 @@ class CustomSpecAlgo:
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
+    def supports_mm_inputs(self) -> bool:
+        """Whether requests with multimodal inputs may be served. ``False``
+        also switches the server warmup to a text-only request."""
+        return True
+
+    def validate_request(
+        self, req: Req, *, has_mm_inputs: bool, enable_overlap: bool
+    ) -> Optional[str]:
+        """Return why this algorithm cannot serve ``req``, or ``None``.
+
+        Called by the scheduler on admission, before the request is queued; a
+        message aborts the request with it. ``has_mm_inputs`` says whether the
+        request carries images / audio / video (``req`` does not hold them
+        yet). Overrides should call ``super().validate_request(...)`` to keep
+        the ``supports_mm_inputs()`` check.
+        """
+        if has_mm_inputs and not self.supports_mm_inputs():
+            return (
+                f"Speculative algorithm {self.name} does not support multimodal inputs."
+            )
+        return None
+
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
@@ -146,6 +168,13 @@ class CustomSpecAlgo:
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
+
+    def req_to_token_extra_len(self, page_size: int) -> int:
+        """Minimum ``req_to_token`` row headroom (tokens) past the context
+        length that this algorithm writes into, e.g. draft / verify slots
+        allocated past ``seq_len``. The row is sized to the max of this and
+        the default headroom, so returning 0 (the default) keeps it."""
+        return 0
 
     def resolve_max_speculative_num_draft_tokens(
         self, server_args: ServerArgs

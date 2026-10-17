@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -185,6 +186,27 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         self.assertIs(v2.create_worker(server_args), MagicMock)
 
+    def test_mm_requests_rejected_only_when_unsupported(self):
+        """The default validate_request turns supports_mm_inputs()=False into a
+        rejection of multimodal requests, and admits text-only ones."""
+        kwargs = dict(enable_overlap=False)
+        self.assertIsNone(
+            self.algo.validate_request(None, has_mm_inputs=True, **kwargs)
+        )
+
+        class _TextOnly(CustomSpecAlgo):
+            def supports_mm_inputs(self):
+                return False
+
+        text_only = _TextOnly("MY_TEXT", factory=MagicMock())
+        self.assertIsNone(
+            text_only.validate_request(None, has_mm_inputs=False, **kwargs)
+        )
+        self.assertIn(
+            "multimodal",
+            text_only.validate_request(None, has_mm_inputs=True, **kwargs),
+        )
+
     def test_create_worker_calls_factory(self):
         server_args = MagicMock()
         server_args.disable_overlap_schedule = True
@@ -204,6 +226,9 @@ class TestServerArgsHook(_RegistryIsolated):
             def handle_server_args(self, server_args):
                 server_args.custom_spec_handle_seen = self.name
                 server_args.speculative_num_draft_tokens = 7
+                server_args.custom_spec_config_seen = (
+                    server_args.speculative_algorithm_config
+                )
 
         @SpeculativeAlgorithm.register(
             "MY_HANDLE_ARGS", supports_overlap=True, spec_class=CustomHandleServerArgs
@@ -226,6 +251,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_sink_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
+            speculative_algorithm_config='{"k": 1}',
         )
 
         handle_speculative_decoding(server_args)
@@ -235,6 +261,18 @@ class TestServerArgsHook(_RegistryIsolated):
         )
         self.assertEqual(server_args.custom_spec_handle_seen, "MY_HANDLE_ARGS")
         self.assertEqual(server_args.speculative_num_draft_tokens, 7)
+        self.assertEqual(server_args.custom_spec_config_seen, '{"k": 1}')
+
+    def test_algorithm_config_rejected_without_a_registered_algorithm(self):
+        """Builtins never read --speculative-algorithm-config, so setting it
+        with one (or with no algorithm) must fail instead of being ignored."""
+        for algorithm in ("EAGLE", None):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.speculative_algorithm = algorithm
+                server_args.speculative_algorithm_config = '{"k": 1}'
+                with self.assertRaisesRegex(ValueError, "algorithm-config"):
+                    handle_speculative_decoding(server_args)
 
 
 class TestSubclassOverride(_RegistryIsolated):
