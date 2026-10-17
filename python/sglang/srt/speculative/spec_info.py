@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -392,6 +393,20 @@ class SpecInputType(IntEnum):
     PP_SPEC_RELAY = auto()
 
 
+@dataclasses.dataclass(frozen=True)
+class FlashInferVerifyVariant:
+    """A custom FlashInfer attention variant for target-verify prefill
+    wrappers, built through FlashInfer's public JIT API:
+    ``BatchPrefillWithPagedKVCacheWrapper(jit_args=jit_args,
+    custom_mask_buf=mask_buf, variant_owns_mask=True)`` on the fa2 backend."""
+
+    # Arguments of flashinfer.jit.gen_customize_batch_prefill_module.
+    jit_args: Tuple[Any, ...]
+    # The wrappers' custom_mask_buf, which the variant reads as
+    # maybe_custom_mask; its owner fills it before each replay.
+    mask_buf: torch.Tensor
+
+
 class SpecInput(ABC):
     # Whether this input carries all state required for CUDA graph replay.
     # Algorithm-specific dataclass subclasses can override this per input.
@@ -461,6 +476,24 @@ class SpecInput(ABC):
         pad_tensor_to_size: Callable[..., torch.Tensor],
         batch_size: int,
     ) -> None:
+        return None
+
+    def flashinfer_verify_variant(
+        self,
+        bs: int,
+        num_tokens: int,
+        *,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        head_dim: int,
+    ) -> Optional[FlashInferVerifyVariant]:
+        """Called by the FlashInfer backend when it creates the target-verify
+        CUDA-graph wrappers of a (bs, num_tokens) graph under capture, with
+        their query and KV-cache dtypes and head dim. Return a
+        FlashInferVerifyVariant to build them with that attention variant
+        instead of the default custom-mask kernel; None (default) keeps the
+        default. The variant computes the mask itself, so these wrappers are
+        planned without one."""
         return None
 
     def attn_kv_lens_cpu(self, seq_lens_cpu: torch.Tensor) -> Optional[torch.Tensor]:
