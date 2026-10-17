@@ -7,11 +7,16 @@
   (``SpecInput.attn_kv_lens_cpu``) is planned by ``fast_prefill_plan`` from
   host arrays, with no device read; a one-request tree mask is packed to its
   host-known size.
+* A spec input may build its graph's verify wrappers with its own FlashInfer
+  attention variant (``SpecInput.flashinfer_verify_variant``), through the
+  public ``jit_args`` / ``variant_owns_mask`` constructor options; such
+  wrappers are planned without a mask.
 
 Backends are built with ``__new__`` and only the attributes each method reads.
 """
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,11 +30,22 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    FlashInferVerifyVariant,
+    SpecInput,
+    SpecInputType,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+class _Wrapper:
+    """A FlashInfer wrapper stand-in (hashable and weak-referenceable)."""
+
+    def __init__(self, **attrs):
+        self.__dict__.update(attrs)
 
 
 def _flashinfer_backend():
@@ -40,11 +56,14 @@ def _flashinfer_backend():
     backend.prefill_backend = "fa2"
     backend.dispatch_reason = None
     backend.indices_updater_prefill = mock.MagicMock()
+    backend.variant_mask_wrappers = weakref.WeakSet()
     created = []
 
-    def create(bs, use_custom_mask=False):
-        wrappers = [SimpleNamespace(begin_forward=None)]
+    def create(bs, use_custom_mask=False, variant=None):
+        wrappers = [_Wrapper(begin_forward=None)]
         created.append(wrappers)
+        if variant is not None:
+            backend.variant_mask_wrappers.update(wrappers)
         return wrappers
 
     backend._create_prefill_wrappers = create
@@ -170,7 +189,8 @@ class TestHostLayoutReplayPlan(CustomTestCase):
             FlashInferIndicesUpdaterPrefill
         )
         updater.attn_backend = SimpleNamespace(
-            kv_index_translator=SimpleNamespace(reads_are_translated=False)
+            kv_index_translator=SimpleNamespace(reads_are_translated=False),
+            variant_mask_wrappers=weakref.WeakSet(),
         )
         updater.kv_last_page_len = torch.ones(4, dtype=torch.int32)
         updater.num_qo_heads, updater.num_kv_heads, updater.head_dim = 8, 2, 64
@@ -243,6 +263,105 @@ class TestHostLayoutReplayPlan(CustomTestCase):
         self.assertEqual(wrapper._custom_mask_buf[:3].tolist(), [7, 9, 11])
         self.assertEqual(wrapper._mask_indptr_buf.tolist(), [0, 3])
         self.assertEqual(wrapper._plan_info, "plan")
+
+
+class _VariantInput(_HostLayoutInput):
+    """A verify input that builds its bs-1 graphs with its own variant."""
+
+    def __init__(self, width):
+        super().__init__(width, custom_mask=torch.ones(64, dtype=torch.bool))
+        self.variant = FlashInferVerifyVariant(
+            jit_args=("uri",), mask_buf=torch.zeros(64, dtype=torch.uint8)
+        )
+        self.variant_calls = []
+
+    def flashinfer_verify_variant(self, bs, num_tokens, **dtypes_and_head_dim):
+        self.variant_calls.append((bs, num_tokens, dtypes_and_head_dim))
+        return self.variant if bs == 1 else None
+
+
+class TestVerifyAttentionVariant(CustomTestCase):
+    def test_capture_builds_the_variant_wrappers_of_the_graph(self):
+        backend, _ = _flashinfer_backend()
+        backend.num_wrappers = 1
+        backend.workspace_buffer = torch.zeros(1)
+        backend.cuda_graph_qo_indptr = backend.kv_indptr = [torch.zeros(8)]
+        backend.cuda_graph_qk_indptr = [torch.zeros(8)]
+        backend.cuda_graph_kv_indices = [torch.zeros(8)]
+        backend.cuda_graph_custom_mask = torch.zeros(8, dtype=torch.uint8)
+        backend.kv_last_page_len = torch.ones(8)
+        backend.indices_updater_prefill = SimpleNamespace(
+            q_data_type=torch.bfloat16, data_type=torch.float8_e4m3fn, head_dim=128
+        )
+        built = []
+        spec_info = _VariantInput(4)
+        layout = dict(
+            q_dtype=torch.bfloat16, kv_dtype=torch.float8_e4m3fn, head_dim=128
+        )
+        with mock.patch.object(
+            fi_mod,
+            "BatchPrefillWithPagedKVCacheWrapper",
+            side_effect=lambda *a, **kw: built.append(kw) or _Wrapper(**kw),
+            create=True,
+        ):
+            del backend._create_prefill_wrappers  # the real one
+            backend._prepare_cuda_graph_metadata(
+                1, 4, ForwardMode.TARGET_VERIFY, spec_info
+            )
+            backend._prepare_cuda_graph_metadata(
+                2, 8, ForwardMode.TARGET_VERIFY, spec_info
+            )
+        self.assertEqual(
+            spec_info.variant_calls,
+            [(bs, n, layout) for bs, n in ((1, 4), (2, 8))],
+        )
+        variant_kw, default_kw = built
+        self.assertEqual(variant_kw["jit_args"], ["uri"])
+        self.assertIs(variant_kw["custom_mask_buf"], spec_info.variant.mask_buf)
+        self.assertTrue(variant_kw["variant_owns_mask"])
+        self.assertNotIn("jit_args", default_kw)
+        self.assertIs(default_kw["custom_mask_buf"], backend.cuda_graph_custom_mask)
+        (variant_wrapper,) = backend.target_verify_cuda_graph_wrappers[(1, 4)]
+        (default_wrapper,) = backend.target_verify_cuda_graph_wrappers[(2, 8)]
+        self.assertIn(variant_wrapper, backend.variant_mask_wrappers)
+        self.assertNotIn(default_wrapper, backend.variant_mask_wrappers)
+
+    def test_variant_wrappers_are_planned_without_a_mask(self):
+        spec_info = _VariantInput(4)
+        updater = FlashInferIndicesUpdaterPrefill.__new__(
+            FlashInferIndicesUpdaterPrefill
+        )
+        updater.kv_last_page_len = torch.ones(4, dtype=torch.int32)
+        updater.num_qo_heads, updater.num_kv_heads, updater.head_dim = 8, 2, 64
+        updater.q_data_type = updater.data_type = torch.bfloat16
+        for in_variant_set in (True, False):
+            calls = []
+            wrapper = _FastPlanRecorder(calls)
+            wrapper.begin_forward = lambda *a, **kw: calls.append(kw)
+            wrapper._custom_mask_buf = torch.zeros(8, dtype=torch.uint8)
+            variant_wrappers = weakref.WeakSet([wrapper] if in_variant_set else [])
+            updater.attn_backend = SimpleNamespace(
+                kv_index_translator=SimpleNamespace(reads_are_translated=False),
+                variant_mask_wrappers=variant_wrappers,
+            )
+            updater.call_begin_forward(
+                wrapper_ragged=None,
+                wrapper_paged=wrapper,
+                req_pool_indices=torch.zeros(1, dtype=torch.int64),
+                paged_kernel_lens=torch.tensor([5]),
+                paged_kernel_lens_sum=5,
+                seq_lens=torch.tensor([5]),
+                prefix_lens=None,
+                kv_start_idx=None,
+                kv_indptr=None,
+                qo_indptr=None,
+                use_ragged=False,
+                spec_info=spec_info,
+                plan=None,
+            )
+            (kwargs,) = calls
+            expected = None if in_variant_set else spec_info.custom_mask
+            self.assertIs(kwargs["custom_mask"], expected)
 
 
 class _RecordingPartial:
