@@ -1525,9 +1525,10 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
     if m <= 16 and n >= 1024:
-        # Decode batches are weight-bandwidth bound, and TGV loads its weight
-        # tiles while it waits on the previous kernel (PDL): it beat cuBLAS on
-        # every dense decode shape swept (k 512-28672, n 1024-57344).
+        # Decode batches only stream the weight, and TGV starts streaming it
+        # while it waits on the previous kernel (PDL): it beat cuBLAS on every
+        # dense decode shape swept (k 512-28672, n 1024-57344), also outside
+        # the k / n bounds below. Narrower n leaves TGV too few CTAs.
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
