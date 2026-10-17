@@ -4,6 +4,9 @@
   replace the GDN target-verify conv1d and recurrence of tree verifies
   (``LinearAttnVerifyExtension``); it sees the state layout and each forward's
   tree layout as small typed values. Builtins return None and keep the kernels.
+* ``target_verify_reads_strided_inputs`` is the one predicate for "this
+  verify takes views of the projections": the extension answers for the tree
+  verifies it handles, so the layer and the backend skip their split kernels.
 * The linear-attention CUDA-graph metadata follows the forward's verify width,
   so graphs narrower than the captured width (a runner may capture several
   verify widths) get query starts and tree links of their own width.
@@ -39,8 +42,9 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class _Recorder(LinearAttnVerifyExtension):
-    def __init__(self, handle=True):
+    def __init__(self, handle=True, strided=False):
         self.handle = handle
+        self.strided = strided
         self.calls = []
         self.attn_out = torch.full((1, 4, 1, 8), 7.0)
 
@@ -49,6 +53,9 @@ class _Recorder(LinearAttnVerifyExtension):
 
     def begin_forward(self, layout, *, in_graph):
         self.calls.append(("begin_forward", layout, in_graph))
+
+    def reads_strided_inputs(self):
+        return self.strided
 
     def conv_update(self, layer, mixed_qkv, **kwargs):
         self.calls.append(("conv_update", tuple(mixed_qkv.shape), sorted(kwargs)))
@@ -304,6 +311,46 @@ class TestTargetVerifyExtension(CustomTestCase):
             )
         self.assertEqual(extension.calls, [])
         backend.kernel_dispatcher.target_verify.assert_called_once()
+
+
+class TestStridedInputs(CustomTestCase):
+    def test_predicate_follows_the_extension_of_a_tree_verify(self):
+        verify = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        base = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
+        self.assertFalse(base.target_verify_reads_strided_inputs(verify))
+        for strided, tree, fb, expected in (
+            (True, True, verify, True),
+            (False, True, verify, False),
+            (True, False, verify, False),
+            (True, True, decode, False),
+        ):
+            backend, *_ = _verify_backend(_Recorder(strided=strided), tree=tree)
+            self.assertIs(backend.target_verify_reads_strided_inputs(fb), expected)
+
+    def test_strided_extension_gets_views_instead_of_the_split_kernel(self):
+        for strided in (True, False):
+            extension = _Recorder(strided=strided)
+            backend, layer, fb, mixed_qkv = _verify_backend(extension)
+            # The backend's own routing never applies to a forward it hands out.
+            backend._use_strided_target_verify_qkv = not strided
+            split = mock.MagicMock(
+                return_value=(
+                    torch.zeros(1, 4, 1, 4),
+                    torch.zeros(1, 4, 1, 4),
+                    torch.zeros(1, 4, 1, 8),
+                )
+            )
+            with (
+                mock.patch.object(gdn_mod, "is_cuda", return_value=True),
+                mock.patch.object(
+                    gdn_mod, "fused_qkv_split_gdn_prefill", split, create=True
+                ),
+            ):
+                backend.forward_extend(
+                    layer, fb, mixed_qkv, a=torch.zeros(4, 1), b=torch.zeros(4, 1)
+                )
+            self.assertEqual(split.called, not strided)
 
 
 def _hybrid_backend(max_bs=2, captured_width=4, topk=4):
