@@ -143,13 +143,8 @@ class TestQwen35GDNPackedInProj(CustomTestCase):
             gdn.in_proj_qkvz.weight.data_ptr(), gdn._fused_in_proj_weight.data_ptr()
         )
 
-    def test_rocm_prepare_hook_is_limited_to_qwen35(self):
-        for model_type, supported in (
-            ("qwen3_5_text", True),
-            ("qwen3_5_moe_text", True),
-            ("qwen4_exp_text", False),
-            ("other_text_model", False),
-        ):
+    def test_prepare_hook_leaves_the_model_type_check_to_finalize(self):
+        for model_type in ("qwen3_5_text", "qwen4_exp_text", "other_text_model"):
             with self.subTest(model_type=model_type):
                 gdn = Mock(spec=self.gdn_cls)
                 gdn._fused_in_proj_weight = None
@@ -161,8 +156,7 @@ class TestQwen35GDNPackedInProj(CustomTestCase):
                 self.module.Qwen3_5ForCausalLM.prepare_before_cuda_graph_capture(
                     model, None
                 )
-                self.assertEqual(model.modules.call_count, int(supported))
-                self.assertEqual(gdn.finalize_fused_in_proj.call_count, int(supported))
+                self.assertEqual(gdn.finalize_fused_in_proj.call_count, 1)
 
     def test_packed_views_alias_and_preserve_values(self):
         gdn = self.gdn
