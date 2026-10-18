@@ -303,12 +303,32 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
             return_value=True,
         ):
             result = select_verify_intermediate_state_indices(
-                default, req_rows, cache_indices >= 0, pool_size=64
+                default, req_rows, lambda: cache_indices >= 0, pool_size=64
             )
 
         torch.testing.assert_close(
             result, torch.tensor([17, 64, 31], dtype=torch.int32)
         )
+
+    def test_verify_scratch_without_pp_builds_no_validity_mask(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
+        )
+
+        default = torch.arange(8, dtype=torch.int32)
+
+        def row_valid():
+            raise AssertionError("mask built although PP spec is off")
+
+        with patch(
+            "sglang.srt.layers.attention.linear.utils.pp_spec_stable_rows_enabled",
+            return_value=False,
+        ):
+            result = select_verify_intermediate_state_indices(
+                default, torch.arange(3), row_valid, pool_size=64
+            )
+
+        self.assertIs(result, default)
 
 
 class TestMtpVerifyHookSignature(CustomTestCase):
