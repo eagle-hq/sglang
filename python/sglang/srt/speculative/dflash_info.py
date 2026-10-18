@@ -13,7 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, verify_indptrs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -144,6 +144,8 @@ class DFlashVerifyInput(SpecInput):
         kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        qo_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
@@ -157,23 +159,25 @@ class DFlashVerifyInput(SpecInput):
             layout = layout.padded_to_bucket(padded_bs=bs)
 
         if layout is None:
-            qo_indptr = torch.arange(
-                0,
-                (bs + 1) * self.draft_token_num,
-                step=self.draft_token_num,
-                dtype=torch.int32,
-                device=device,
+            qo_indptr, cum_kv_seq_len = verify_indptrs(
+                bs,
+                self.draft_token_num,
+                device,
+                qo_indptr_buf=qo_indptr_buf,
+                kv_indptr_buf=kv_indptr_buf,
             )
             verify_lens = self.draft_token_num
             kv_indices_extra = self.draft_token_num * bs
         else:
             qo_indptr = layout.qo_indptr_device
+            cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             verify_lens = layout.verify_lens
             kv_indices_extra = layout.total_verify_tokens
 
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         paged_kernel_lens = paged_kernel_lens + verify_lens
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+        torch.cumsum(
+            paged_kernel_lens, dim=0, dtype=torch.int32, out=cum_kv_seq_len[1:]
+        )
 
         if kv_indices_buf is not None:
             # Sync-free fast-plan path: write straight into the attention

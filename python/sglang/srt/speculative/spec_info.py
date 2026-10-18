@@ -546,6 +546,37 @@ class SpecInput(ABC):
         return None
 
 
+def verify_indptrs(
+    bs: int,
+    num_tokens_per_req: int,
+    device: torch.device,
+    *,
+    qo_indptr_buf: Optional[torch.Tensor] = None,
+    kv_indptr_buf: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(qo_indptr, kv_indptr)`` of a paged attention over ``bs`` requests with
+    ``num_tokens_per_req`` query rows each. ``qo_indptr`` is filled;
+    ``kv_indptr[0]`` is 0 and the caller writes ``kv_indptr[1:]``.
+
+    Given a CUDA-graph wrapper's indptr buffers, both are views of them, so the
+    wrapper's plan needs no copy. A wrapper's kv indptr buffer already holds 0
+    at entry 0: every indptr planned into it starts at 0.
+    """
+    qo_indptr = torch.arange(
+        0,
+        (bs + 1) * num_tokens_per_req,
+        step=num_tokens_per_req,
+        dtype=torch.int32,
+        device=device,
+        out=None if qo_indptr_buf is None else qo_indptr_buf[: bs + 1],
+    )
+    if kv_indptr_buf is None:
+        kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+    else:
+        kv_indptr = kv_indptr_buf[: bs + 1]
+    return qo_indptr, kv_indptr
+
+
 def spec_scale_global_num_tokens(
     spec_info: SpecInput,
     global_num_tokens: List[int],
