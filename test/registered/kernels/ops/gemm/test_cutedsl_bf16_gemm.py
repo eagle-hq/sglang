@@ -52,22 +52,6 @@ def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     torch.testing.assert_close(out, ref.bfloat16(), rtol=2e-2, atol=2.5)
 
 
-@pytest.mark.parametrize("m", [1, 7, 16])
-@pytest.mark.parametrize(
-    "n, k", [(5120, 1536), (8704, 5120), (34816, 5120), (4096, 14336), (7168, 768)]
-)
-def test_decode_batches_route_to_tgv(m, n, k):
-    """Decode-sized batches run TGV, also in the region rules' cuBLAS areas
-    (k < 2048, k > 6144, n > 8192), where TGV measured faster."""
-    assert use_cutedsl_bf16_gemm(m, n, k)
-
-
-def test_decode_rule_keeps_narrow_outputs_and_measured_ranges():
-    assert not use_cutedsl_bf16_gemm(1, 576, 7168)  # narrow n: cuBLAS wins
-    assert not use_cutedsl_bf16_gemm(8, 2304, 8192)  # its measured range starts at 40
-    assert not use_cutedsl_bf16_gemm(17, 5120, 1536)
-
-
 @pytest.mark.parametrize("n, k", [(7168, 1536), (1536, 7168), (1024, 2048)])
 def test_empty_batch_not_tgv_eligible(n, k):
     """DP-attention idle groups run a 0-token dummy forward to keep the

@@ -90,6 +90,14 @@ class TestIndexKeyCacheMove(CustomTestCase):
         with self.assertRaises(NotImplementedError):
             cache.move(torch.tensor([1]), torch.tensor([2]))
 
+    def test_page_size_one_moves_rows_in_any_layout(self):
+        """With one token per row the row copy is right whatever the layout."""
+        cache = _cache(1)
+        cache.pool.index_page_size = 2
+        before = cache.buffer[0].clone()
+        cache.move(torch.tensor([0]), torch.tensor([3]))
+        self.assertTrue(torch.equal(cache.buffer[0][0], before[3]))
+
 
 if __name__ == "__main__":
     unittest.main()

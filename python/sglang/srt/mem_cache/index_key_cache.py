@@ -61,6 +61,15 @@ class IndexKeyCache:
         move each token's byte ranges instead of whole rows."""
         if tgt_loc.numel() == 0:
             return
+        if self.pool.page_size == 1:
+            # A row is one token's entry in every layout.
+            tgt_loc_flat = tgt_loc.view(-1).long()
+            src_loc_flat = src_loc.view(-1).long()
+            for index_k in self.buffer:
+                if index_k.shape[0] == 0:
+                    continue
+                index_k[tgt_loc_flat] = index_k[src_loc_flat]
+            return
         if (
             index_buf_accessor._use_aiter_preshuffle
             or self.pool.index_page_size != self.pool.page_size
