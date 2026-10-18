@@ -74,6 +74,15 @@ def fused_replay_state_indices(
 
     Returns the filled ``out_state_indices[:total_bs]`` view.
     """
+    if v2p is None and valid_bs == total_bs:
+        # Nothing to pad or translate: the chain is one gather, and an ATen
+        # launch costs the host less than this kernel's.
+        return torch.index_select(
+            mamba_index_mapping,
+            0,
+            req_pool_indices[:total_bs],
+            out=out_state_indices[:total_bs],
+        )
     _fused_replay_state_indices_kernel[(1,)](
         req_pool_indices,
         mamba_index_mapping,
