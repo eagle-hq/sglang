@@ -1,9 +1,10 @@
-"""Greedy next-token ids from vocab shards - CPU only.
+"""Greedy next-token ids from a vocab-parallel argmax - CPU only.
 
 A forward whose spec input sets ``greedy_tokens_only`` gets
 ``LogitsProcessorOutput.next_token_ids`` (the argmax of the logits it would
 otherwise return) and ``next_token_logits=None``: each tensor-parallel rank
-reduces its vocab shard to (max, index) and the ranks gather only those pairs.
+reduces its part of the vocabulary to (max, index) and the ranks gather only
+those pairs.
 """
 
 import contextlib

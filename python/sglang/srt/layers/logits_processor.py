@@ -1003,11 +1003,11 @@ class LogitsProcessor(nn.Module):
         self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
     ) -> Optional[torch.Tensor]:
         """The argmax of the logits _get_logits returns, [rows] int64, without
-        gathering them: each rank reduces its vocab shard to (max, index) and
-        the ranks gather those pairs. Ties resolve to the lowest id, as in
-        torch.argmax. None where the logits are not plain vocab shards
-        (DP-attention or attention-TP gathers, soft-capping, which can tie
-        distinct logits)."""
+        gathering them: each rank reduces its part of the tensor-parallel
+        vocabulary to (max, index) and the ranks gather those pairs. Ties
+        resolve to the lowest id, as in torch.argmax. None where the logits are
+        not a plain vocab-parallel split (DP-attention or attention-TP gathers,
+        soft-capping, which can tie distinct logits)."""
         shard = getattr(lm_head, "shard_indices", None)
         if (
             shard is None
