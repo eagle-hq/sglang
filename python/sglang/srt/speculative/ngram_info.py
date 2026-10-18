@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, verify_indptrs
 
 
 class NgramVerifyInput(SpecInput):
@@ -66,24 +66,35 @@ class NgramVerifyInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
+        qo_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
-        ``kv_indices``."""
+        ``kv_indices``. Given ``*_buf`` (a CUDA-graph wrapper's input buffers),
+        the arrays are built in them."""
         bs = req_pool_indices.numel()
 
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+        self.qo_indptr, cum_kv_seq_len = verify_indptrs(
+            bs,
+            self.draft_token_num,
+            self.device,
+            qo_indptr_buf=qo_indptr_buf,
+            kv_indptr_buf=kv_indptr_buf,
+        )
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        self.qo_indptr = (
-            torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
-            * self.draft_token_num
+        torch.cumsum(
+            paged_kernel_lens, dim=0, dtype=torch.int32, out=cum_kv_seq_len[1:]
         )
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * bs
-        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=self.device)
+        kv_indices = (
+            kv_indices_buf
+            if kv_indices_buf is not None
+            else torch.empty(total_tokens, dtype=torch.int32, device=self.device)
+        )
 
         translator.pack_read_stream(
             plan,
