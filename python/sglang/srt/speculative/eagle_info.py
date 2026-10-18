@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, verify_indptrs
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 
@@ -96,35 +96,28 @@ class EagleVerifyInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
-        qo_indptr_buf: Optional[torch.Tensor] = None,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the translator packs the read ids straight into
-        ``kv_indices``. Given ``*_buf`` (a CUDA-graph wrapper's input buffers),
-        the arrays are built in them."""
+        ``kv_indices``."""
         device = req_pool_indices.device
         batch_size = req_pool_indices.numel()
-        qo_indptr, cum_kv_seq_len = verify_indptrs(
-            batch_size,
-            self.draft_token_num,
-            device,
-            qo_indptr_buf=qo_indptr_buf,
-            kv_indptr_buf=kv_indptr_buf,
+        qo_indptr = torch.arange(
+            0,
+            (1 + batch_size) * self.draft_token_num,
+            step=self.draft_token_num,
+            dtype=torch.int32,
+            device=device,
+        )
+        cum_kv_seq_len = torch.zeros(
+            (batch_size + 1,), dtype=torch.int32, device=device
         )
 
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        torch.cumsum(
-            paged_kernel_lens, dim=0, dtype=torch.int32, out=cum_kv_seq_len[1:]
-        )
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         total_tokens = paged_kernel_lens_sum + self.draft_token_num * batch_size
-        kv_indices = (
-            kv_indices_buf
-            if kv_indices_buf is not None
-            else torch.empty(total_tokens, dtype=torch.int32, device=device)
-        )
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=device)
         translator.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
@@ -419,35 +412,28 @@ class EagleDraftExtendInput(SpecInput):
         translator: KVIndexTranslator,
         plan: KVLocPlan,
         kind: IdSpaceKind = IdSpaceKind.FULL,
-        qo_indptr_buf: Optional[torch.Tensor] = None,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
-        draft-extend window. Given ``*_buf`` (a CUDA-graph wrapper's input
-        buffers), the arrays are built in them."""
+        draft-extend window."""
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
-        qo_indptr, cum_kv_seq_len = verify_indptrs(
-            bs,
-            self.num_tokens_per_req,
-            device,
-            qo_indptr_buf=qo_indptr_buf,
-            kv_indptr_buf=kv_indptr_buf,
+        qo_indptr = torch.arange(
+            0,
+            (bs + 1) * self.num_tokens_per_req,
+            step=self.num_tokens_per_req,
+            dtype=torch.int32,
+            device=device,
         )
-        torch.cumsum(
-            paged_kernel_lens, dim=0, dtype=torch.int32, out=cum_kv_seq_len[1:]
-        )
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        if kv_indices_buf is not None:
-            kv_indices = kv_indices_buf
-        else:
-            if paged_kernel_lens_sum is None:
-                paged_kernel_lens_sum = cum_kv_seq_len[-1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum, dtype=torch.int32, device=device
-            )
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device=device
+        )
 
         translator.pack_read_stream(
             plan,

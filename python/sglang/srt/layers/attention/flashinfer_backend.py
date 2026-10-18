@@ -14,7 +14,6 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
-import inspect
 import logging
 import os
 import weakref
@@ -88,13 +87,6 @@ if is_flashinfer_available():
         packbits,
     )
     from flashinfer.cascade import merge_state
-
-    # A FlashInfer whose forward() takes `out` writes into a caller's output
-    # instead of a zero-filled one (no release has it yet).
-    _PAGED_PREFILL_FORWARD_TAKES_OUT = (
-        "out"
-        in inspect.signature(BatchPrefillWithPagedKVCacheWrapper.forward).parameters
-    )
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
@@ -264,20 +256,16 @@ def fast_prefill_plan(
     self._token_pos_in_items_len = token_pos_in_items_len
     self._max_item_len_ptr = max_item_len_ptr
 
-    # Refresh the cuda-graph input buffers (device-to-device, non-blocking),
-    # except the arrays the caller built in them.
-    for buf, src in (
-        (self._qo_indptr_buf, qo_indptr),
-        (self._paged_kv_indptr_buf, paged_kv_indptr),
-        (self._paged_kv_last_page_len_buf, paged_kv_last_page_len),
-    ):
-        if src.data_ptr() != buf.data_ptr():
-            buf.copy_(src, non_blocking=non_blocking)
-    if paged_kv_indices.data_ptr() != self._paged_kv_indices_buf.data_ptr():
-        self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-            paged_kv_indices,
-            non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
-        )
+    # Refresh the cuda-graph input buffers (device-to-device, non-blocking).
+    self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+    self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
+    self._paged_kv_last_page_len_buf.copy_(
+        paged_kv_last_page_len, non_blocking=non_blocking
+    )
+    self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+        paged_kv_indices,
+        non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
+    )
     if packed_custom_mask is not None:
         self._custom_mask_buf[: len(packed_custom_mask)].copy_(
             packed_custom_mask, non_blocking=non_blocking
@@ -314,13 +302,6 @@ def fast_prefill_plan(
         0,  # uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
-
-
-def _uses_fast_prefill_plan(wrapper: BatchPrefillWithPagedKVCacheWrapper) -> bool:
-    """Whether ``wrapper``'s begin_forward is ``fast_prefill_plan`` (installed at
-    capture on CUDA-graph wrappers whose replays have a host-known layout)."""
-    begin_forward = wrapper.begin_forward
-    return getattr(begin_forward, "func", None) is fast_prefill_plan
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -1450,18 +1431,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            # A target verify on fa2 writes every output row (each request's qo
-            # range covers its draft tokens), so the zero fill can be skipped.
-            out = None
-            if (
-                _PAGED_PREFILL_FORWARD_TAKES_OUT
-                and forward_batch.forward_mode.is_target_verify()
-                and self.prefill_backend == "fa2"
-            ):
-                out = torch.empty_like(q)
             o = prefill_wrapper_paged.forward(
-                q,
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
@@ -1483,7 +1454,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
-                **({} if out is None else {"out": out}),
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -2316,17 +2286,6 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            # Like decode, build the arrays of a CUDA-graph replay straight in
-            # the wrapper's input buffers; fast_prefill_plan then copies none.
-            graph_buffers = (
-                dict(
-                    qo_indptr_buf=wrapper_paged._qo_indptr_buf,
-                    kv_indptr_buf=wrapper_paged._paged_kv_indptr_buf,
-                    kv_indices_buf=wrapper_paged._paged_kv_indices_buf,
-                )
-                if _uses_fast_prefill_plan(wrapper_paged)
-                else {}
-            )
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -2337,7 +2296,6 @@ class FlashInferIndicesUpdaterPrefill:
                         plan=plan,
                         kind=read_kind,
                         kv_start_idx=kv_start_idx,
-                        **graph_buffers,
                     )
                 )
             else:
@@ -2349,7 +2307,6 @@ class FlashInferIndicesUpdaterPrefill:
                         translator=translator,
                         plan=plan,
                         kind=read_kind,
-                        **graph_buffers,
                     )
                 )
 
@@ -2418,7 +2375,10 @@ class FlashInferIndicesUpdaterPrefill:
         num_tokens_per_req = (
             spec_info.num_tokens_per_req if spec_info is not None else None
         )
-        uses_fast_prefill = _uses_fast_prefill_plan(wrapper_paged)
+        uses_fast_prefill = (
+            hasattr(wrapper_paged.begin_forward, "func")
+            and wrapper_paged.begin_forward.func is fast_prefill_plan
+        )
         if uses_fast_prefill:
             assert seq_lens_cpu is not None, (
                 "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
