@@ -59,6 +59,12 @@ On the verify input (a `SpecInput` subclass, for example of `EagleVerifyInput`):
 | `attn_kv_lens_cpu(self, seq_lens_cpu) -> Optional[torch.Tensor]` | `None`; EAGLE, NGRAM and DFLASH inputs implement it | Host copy of the KV lengths `generate_attn_arg_prefill` lays out. When it is known, the FlashInfer backend plans target-verify graph replays without copying the layout back from the GPU. |
 | `flashinfer_verify_variant(self, bs, num_tokens, *, q_dtype, kv_dtype, head_dim) -> Optional[FlashInferVerifyVariant]` | `None`: the builtin custom-mask attention | When the FlashInfer backend creates the target-verify wrappers of a captured graph. A `FlashInferVerifyVariant(jit_args, mask_buf)` builds them with FlashInfer's public `jit_args`, `custom_mask_buf=mask_buf` and `variant_owns_mask=True` (fa2 backend); the variant reads `mask_buf`, which its owner fills before each replay. |
 
+In a worker that verifies through `run_eagle_verify` (`speculative/eagle_worker_common.py`), for example an `EAGLEWorkerV2` subclass:
+
+| Hook | Default | Called |
+|---|---|---|
+| `run_eagle_verify(..., accept_step: Optional[VerifyAcceptStep])` | `None`: sglang's sampling and acceptance | Once per verified batch, on the forward stream, right after the target verify forward, as `accept_step(batch, logits_output, can_run_cuda_graph)`. It replaces sampling, acceptance, the state commit, the KV move of the accepted path and the compaction of the accepted rows for that batch, must leave the KV cache, the linear-attention states and `logits_output.hidden_states` as the default code would, and returns a `VerifyAcceptResult(next_token_ids, accept_lens, new_seq_lens, bonus_tokens)` in the default code's layout. Pass it only for the batches the step handles (for example greedy ones). |
+
 ## Algorithm configuration
 
 Pass algorithm-specific settings with `--speculative-algorithm-config`. SGLang does not parse the value; your algorithm defines the format, for example a JSON string or a path to a JSON file. SGLang rejects the flag when the selected algorithm is a builtin or none is selected.

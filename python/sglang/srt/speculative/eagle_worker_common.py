@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+import dataclasses
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -53,6 +54,7 @@ if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
@@ -562,6 +564,27 @@ def _compact_accept_to_front(
     return out
 
 
+@dataclasses.dataclass(frozen=True)
+class VerifyAcceptResult:
+    """The accepted tokens of a verified batch, as an accept step returns them.
+
+    Each tensor has the shape, dtype and layout of the one sglang's own accept
+    code puts in ``GenerationBatchResult`` (``next_token_ids``, ``accept_lens``,
+    ``new_seq_lens``) and in the next ``EagleDraftInput`` (``bonus_tokens``).
+    """
+
+    next_token_ids: torch.Tensor
+    accept_lens: torch.Tensor
+    new_seq_lens: torch.Tensor
+    bonus_tokens: torch.Tensor
+
+
+# (batch, logits_output, can_run_cuda_graph) -> the batch's accepted tokens.
+VerifyAcceptStep = Callable[
+    ["ScheduleBatch", "LogitsProcessorOutput", bool], VerifyAcceptResult
+]
+
+
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
@@ -578,6 +601,7 @@ def run_eagle_verify(
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
+    accept_step: Optional[VerifyAcceptStep] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -590,6 +614,15 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+
+    ``accept_step`` lets a speculative algorithm replace everything after the
+    target forward for this batch: sampling, acceptance, the state commit, the
+    KV move of the accepted path and the compaction of the accepted rows. It is
+    called once, on the forward stream, right after the target verify forward,
+    with ``(batch, logits_output, can_run_cuda_graph)``. It must leave the KV
+    cache, the linear-attention states and ``logits_output.hidden_states`` as
+    the default accept code would, and return the accepted tokens. None (the
+    default) runs sglang's accept code.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -676,6 +709,21 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+
+    if accept_step is not None:
+        accepted = accept_step(batch, logits_output, can_run_cuda_graph)
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=accepted.next_token_ids,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=EagleDraftInput(bonus_tokens=accepted.bonus_tokens),
+            accept_lens=accepted.accept_lens,
+            new_seq_lens=accepted.new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+        )
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None
