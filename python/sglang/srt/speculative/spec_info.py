@@ -111,6 +111,11 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft
+        (EAGLE-3 style, layers from the draft's ``eagle_config``)."""
+        return self.is_eagle3()
+
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
