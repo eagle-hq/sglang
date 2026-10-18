@@ -556,18 +556,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         self._use_strided_target_verify_qkv = False
         mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
-        self.verify_extension = (
-            model_runner.spec_algorithm.create_linear_attn_verify_extension(
-                LinearAttnStateLayout(
-                    conv_state_len=self.conv_states_shape[-1],
-                    conv_dtype=mamba_cache.conv[0].dtype,
-                    ssm_dtype=mamba_cache.temporal.dtype,
-                    num_v_heads=mamba_cache.temporal.shape[-3],
-                    has_state_snapshots=mamba_cache.intermediate_ssm is not None,
-                    device=torch.device(self.device),
+        # Only a pool with speculative state runs target verify forwards.
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            self.verify_extension = (
+                model_runner.spec_algorithm.create_linear_attn_verify_extension(
+                    LinearAttnStateLayout(
+                        conv_state_len=self.conv_states_shape[-1],
+                        conv_dtype=mamba_cache.conv[0].dtype,
+                        ssm_dtype=mamba_cache.temporal.dtype,
+                        num_v_heads=mamba_cache.temporal.shape[-3],
+                        has_state_snapshots=mamba_cache.intermediate_ssm is not None,
+                        device=torch.device(self.device),
+                    )
                 )
             )
-        )
         # The verify layout the extension handles this forward, else None.
         self._verify_extension_layout: Optional[LinearAttnVerifyLayout] = None
 

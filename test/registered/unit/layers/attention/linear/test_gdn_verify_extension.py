@@ -74,9 +74,9 @@ class TestDefaults(CustomTestCase):
         plugin = CustomSpecAlgo(name="PLUGIN", factory=lambda server_args: None)
         self.assertIsNone(plugin.create_linear_attn_verify_extension(None))
 
-    def test_backend_asks_the_algorithm(self):
-        extension = _Recorder()
+    def _build_backend(self, mamba_cache):
         asked = []
+        extension = _Recorder()
 
         def create(state):
             asked.append(state)
@@ -87,14 +87,7 @@ class TestDefaults(CustomTestCase):
                 decode=None, prefill=None, verify=None
             ),
             req_to_token_pool=SimpleNamespace(
-                size=4,
-                mamba_pool=SimpleNamespace(
-                    mamba_cache=SimpleNamespace(
-                        conv=[torch.zeros(4, 8, 3, dtype=torch.bfloat16)],
-                        temporal=torch.zeros(2, 4, 6, 8, 8),
-                        intermediate_ssm=torch.zeros(1),
-                    )
-                ),
+                size=4, mamba_pool=SimpleNamespace(mamba_cache=mamba_cache)
             ),
             device="cpu",
             spec_algorithm=SimpleNamespace(create_linear_attn_verify_extension=create),
@@ -119,6 +112,17 @@ class TestDefaults(CustomTestCase):
             ),
         ):
             backend = GDNAttnBackend(model_runner)
+        return backend, extension, asked
+
+    def test_backend_asks_the_algorithm(self):
+        backend, extension, asked = self._build_backend(
+            MambaPool.SpeculativeState(
+                conv=[torch.zeros(4, 8, 3, dtype=torch.bfloat16)],
+                temporal=torch.zeros(2, 4, 6, 8, 8),
+                intermediate_ssm=torch.zeros(1),
+                intermediate_conv_window=[torch.zeros(1)],
+            )
+        )
         self.assertIs(backend.verify_extension, extension)
         self.assertEqual(
             asked,
@@ -133,6 +137,17 @@ class TestDefaults(CustomTestCase):
                 )
             ],
         )
+
+    def test_pool_without_speculative_state_gets_no_extension(self):
+        # A server without speculation holds a plain State (no snapshots).
+        backend, _, asked = self._build_backend(
+            MambaPool.State(
+                conv=[torch.zeros(4, 8, 3, dtype=torch.bfloat16)],
+                temporal=torch.zeros(2, 4, 6, 8, 8),
+            )
+        )
+        self.assertIsNone(backend.verify_extension)
+        self.assertEqual(asked, [])
 
 
 class TestLifecycle(CustomTestCase):
