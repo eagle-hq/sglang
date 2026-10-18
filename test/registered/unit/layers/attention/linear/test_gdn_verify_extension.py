@@ -4,9 +4,10 @@
   replace the GDN target-verify conv1d and recurrence of tree verifies
   (``LinearAttnVerifyExtension``); it sees the state layout and each forward's
   tree layout as small typed values. Builtins return None and keep the kernels.
-* ``target_verify_reads_strided_inputs`` is the one predicate for "this
-  verify takes views of the projections": the extension answers for the tree
-  verifies it handles, so the layer and the backend skip their split kernels.
+* ``target_verify_takes_projection_views`` says whether a verify takes views
+  of the layer's input projection: the extension answers for the tree verifies
+  it handles (builtins take split copies), so the layer and the backend skip
+  their split kernels.
 * The linear-attention CUDA-graph metadata follows the forward's verify width,
   so graphs narrower than the captured width (a runner may capture several
   verify widths) get query starts and tree links of their own width.
@@ -333,7 +334,7 @@ class TestStridedInputs(CustomTestCase):
         verify = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
         decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
         base = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
-        self.assertFalse(base.target_verify_reads_strided_inputs(verify))
+        self.assertFalse(base.target_verify_takes_projection_views(verify))
         for strided, tree, fb, expected in (
             (True, True, verify, True),
             (False, True, verify, False),
@@ -341,7 +342,7 @@ class TestStridedInputs(CustomTestCase):
             (True, True, decode, False),
         ):
             backend, *_ = _verify_backend(_Recorder(strided=strided), tree=tree)
-            self.assertIs(backend.target_verify_reads_strided_inputs(fb), expected)
+            self.assertIs(backend.target_verify_takes_projection_views(fb), expected)
 
     def test_strided_extension_gets_views_instead_of_the_split_kernel(self):
         for strided in (True, False):

@@ -1006,7 +1006,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
             packed_verify = getattr(backend, "supports_packed_verify", False)
-            strided_verify = backend.target_verify_reads_strided_inputs(forward_batch)
+            takes_views = getattr(backend, "target_verify_takes_projection_views", None)
+            strided_verify = takes_views is not None and takes_views(forward_batch)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
             and (forward_batch.forward_mode.is_decode() or packed_verify)

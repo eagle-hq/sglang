@@ -19,10 +19,8 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-        DecodeCudaGraphRunner,
-    )
     from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphRunnerInfo,
         DecodeGraphVariants,
     )
     from sglang.srt.server_args import ServerArgs
@@ -84,6 +82,13 @@ class CustomSpecAlgo:
         return False
 
     def is_eagle3(self) -> bool:
+        return False
+
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft,
+        from the layers the draft's ``eagle_config`` names, and the draft reads
+        their concatenation. Lets an EAGLE-family plugin get only that
+        EAGLE-3 behavior without answering ``is_eagle3()``."""
         return False
 
     def is_frozen_kv_mtp(self) -> bool:
@@ -187,14 +192,15 @@ class CustomSpecAlgo:
         return 0
 
     def create_decode_graph_variants(
-        self, runner: DecodeCudaGraphRunner
+        self, info: DecodeGraphRunnerInfo
     ) -> Optional[DecodeGraphVariants]:
-        """Extra CUDA-graph variants for a decode / target-verify ``runner``
+        """Extra CUDA-graph variants for a decode / target-verify runner
         (see ``model_executor/runner/decode_graph_variants.py``), for example
         one target-verify graph per verify width. Called once per runner,
-        target and draft alike; check ``runner.model_runner.is_draft_worker``
-        and ``runner.capture_forward_mode``. ``None`` (the default) keeps one
-        graph per batch size at the static width."""
+        target and draft alike, before the runner captures; ``info`` says
+        which (``is_draft_worker``, ``capture_forward_mode``), the widest
+        verify it fits and its device. ``None`` (the default) keeps one graph
+        per batch size at the static width."""
         return None
 
     def create_linear_attn_verify_extension(

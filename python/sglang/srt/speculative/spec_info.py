@@ -28,10 +28,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-        DecodeCudaGraphRunner,
-    )
     from sglang.srt.model_executor.runner.decode_graph_variants import (
+        DecodeGraphRunnerInfo,
         DecodeGraphVariants,
     )
     from sglang.srt.server_args import ServerArgs
@@ -121,6 +119,11 @@ class SpeculativeAlgorithm(Enum):
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
+
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft
+        (EAGLE-3 style, layers from the draft's ``eagle_config``)."""
+        return self.is_eagle3()
 
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
@@ -265,10 +268,10 @@ class SpeculativeAlgorithm(Enum):
         return 0
 
     def create_decode_graph_variants(
-        self, runner: DecodeCudaGraphRunner
+        self, info: DecodeGraphRunnerInfo
     ) -> Optional[DecodeGraphVariants]:
-        """Extra CUDA-graph variants for ``runner``; builtins capture one
-        graph per batch size at the static width."""
+        """Extra CUDA-graph variants for the runner ``info`` describes;
+        builtins capture one graph per batch size at the static width."""
         return None
 
     def create_linear_attn_verify_extension(

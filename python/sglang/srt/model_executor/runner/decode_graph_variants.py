@@ -16,7 +16,8 @@
 A speculative algorithm whose verify width changes from step to step (for
 example an adaptive draft length) cannot replay one graph per batch size at
 the static width. It returns a ``DecodeGraphVariants`` from
-``create_decode_graph_variants(runner)`` and the runner then:
+``create_decode_graph_variants(info)`` (``info`` is the runner's
+``DecodeGraphRunnerInfo``) and the runner then:
 
 * captures, per batch size, one graph per ``capture_variants(bs)`` entry, each
   at ``bs * variant.num_tokens_per_req`` tokens, keyed by
@@ -29,7 +30,7 @@ the static width. It returns a ``DecodeGraphVariants`` from
   its out-of-graph metadata (``end_metadata``).
 
 Every width must fit the runner's static buffers
-(``num_tokens_per_req <= runner.captured_req_width``). The provider owns the
+(``num_tokens_per_req <= info.max_tokens_per_req``). The provider owns the
 graph axis: when one is set, the runner captures no default-width graph.
 Without a provider (the default for every builtin algorithm) the runner is
 unchanged.
@@ -40,8 +41,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+
+class DecodeGraphRunnerInfo(NamedTuple):
+    """What a variants provider may know about the runner that asks for it."""
+
+    is_draft_worker: bool
+    # DECODE, TARGET_VERIFY or DLLM_EXTEND: the mode the runner captures.
+    capture_forward_mode: ForwardMode
+    # The widest verify a variant may use (the runner's static buffers).
+    max_tokens_per_req: int
+    device: torch.device
 
 
 class DecodeGraphVariant(NamedTuple):

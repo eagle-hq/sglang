@@ -23,6 +23,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.decode_graph_variants import (
+    DecodeGraphRunnerInfo,
     DecodeGraphVariant,
     DecodeGraphVariants,
 )
@@ -124,23 +125,27 @@ def _verify_batch(bs, width):
 
 class TestDefaultIsNoVariants(CustomTestCase):
     def test_builtin_and_plugin_defaults_return_none(self):
-        runner = _bare_runner()
-        self.assertIsNone(
-            SpeculativeAlgorithm.EAGLE.create_decode_graph_variants(runner)
-        )
+        info = DecodeGraphRunnerInfo(False, ForwardMode.TARGET_VERIFY, 4, "cpu")
+        self.assertIsNone(SpeculativeAlgorithm.EAGLE.create_decode_graph_variants(info))
         plugin = CustomSpecAlgo(name="PLUGIN", factory=lambda server_args: None)
-        self.assertIsNone(plugin.create_decode_graph_variants(runner))
+        self.assertIsNone(plugin.create_decode_graph_variants(info))
 
     def test_init_asks_the_algorithm_and_disables_metadata_glue(self):
         provider = _Widths()
+        asked = []
         runner = _bare_runner()
         runner.model_runner.spec_algorithm = SimpleNamespace(
-            create_decode_graph_variants=lambda r: provider
+            create_decode_graph_variants=lambda info: asked.append(info) or provider
         )
         runner._metadata_glue = object()
         runner._init_graph_variants()
         self.assertIs(runner.graph_variants, provider)
         self.assertIsNone(runner._metadata_glue)
+        # The provider learns the runner's role, mode, width and device only.
+        self.assertEqual(
+            asked,
+            [DecodeGraphRunnerInfo(False, ForwardMode.TARGET_VERIFY, 4, "cpu")],
+        )
 
         plain = _bare_runner()
         glue = object()

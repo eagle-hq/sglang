@@ -82,6 +82,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner.decode_graph_variants import (
+    DecodeGraphRunnerInfo,
     DecodeGraphVariant,
     DecodeGraphVariants,
 )
@@ -659,7 +660,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Ask the speculative algorithm for extra graph variants (see
         decode_graph_variants.py). None keeps one graph per batch size."""
         self.graph_variants = (
-            self.model_runner.spec_algorithm.create_decode_graph_variants(self)
+            self.model_runner.spec_algorithm.create_decode_graph_variants(
+                DecodeGraphRunnerInfo(
+                    is_draft_worker=self.model_runner.is_draft_worker,
+                    capture_forward_mode=self.capture_forward_mode,
+                    max_tokens_per_req=self.captured_req_width,
+                    device=self.model_runner.device,
+                )
+            )
         )
         # (bs, label) pairs captured; replay of anything else runs eager.
         self._captured_graph_variants: set[tuple[int, str]] = set()
