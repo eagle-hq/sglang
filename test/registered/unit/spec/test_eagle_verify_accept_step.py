@@ -32,7 +32,7 @@ class _DefaultAcceptRan(Exception):
     pass
 
 
-def _verify(accept_step=None):
+def _verify(accept_step=None, **batch_overrides):
     """run_eagle_verify on a stub batch; returns (result, forward batch, logits output)."""
     forward_batch = SimpleNamespace(name="verify forward batch")
     logits_output = SimpleNamespace(
@@ -56,7 +56,17 @@ def _verify(accept_step=None):
         input_ids=None,
         out_cache_loc=None,
         has_grammar=False,
+        return_logprob=False,
+        sampling_info=SimpleNamespace(
+            is_all_greedy=True,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias=None,
+        ),
     )
+    for name, value in batch_overrides.items():
+        target = batch.sampling_info if hasattr(batch.sampling_info, name) else batch
+        setattr(target, name, value)
     with (
         mock.patch.object(common, "record_stream_for_v2_verify"),
         mock.patch.object(common, "record_stream_each"),
@@ -111,6 +121,23 @@ class TestVerifyAcceptStep(CustomTestCase):
         self.assertEqual(result.routed_experts_output, "routed")
         self.assertEqual(result.indexer_topk_output, "indexer")
         self.assertEqual(len(result.extra_keep_alive_refs), 1)
+
+    def test_accept_step_refuses_batches_it_cannot_serve(self):
+        def accept_step(batch, logits_output, can_run_cuda_graph):
+            raise AssertionError("accept_step ran")
+
+        for override, word in (
+            (dict(has_grammar=True), "grammar"),
+            (dict(return_logprob=True), "logprobs"),
+            (dict(is_all_greedy=False), "non-greedy"),
+            (dict(acc_scaling_penalties=torch.ones(1)), "penalties"),
+            (dict(logit_bias=torch.zeros(1, 4)), "logit bias"),
+        ):
+            with self.subTest(word), self.assertRaisesRegex(ValueError, word):
+                _verify(accept_step, **override)
+        # The default accept code serves every batch.
+        with self.assertRaises(_DefaultAcceptRan):
+            _verify(None, return_logprob=True)
 
     def test_without_accept_step_sglang_accepts(self):
         with self.assertRaises(_DefaultAcceptRan):

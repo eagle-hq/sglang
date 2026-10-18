@@ -63,7 +63,7 @@ In a worker that verifies through `run_eagle_verify` (`speculative/eagle_worker_
 
 | Hook | Default | Called |
 |---|---|---|
-| `run_eagle_verify(..., accept_step: Optional[VerifyAcceptStep])` | `None`: sglang's sampling and acceptance | Once per verified batch, on the forward stream, right after the target verify forward, as `accept_step(batch, logits_output, can_run_cuda_graph)`. It replaces sampling, acceptance, the state commit, the KV move of the accepted path and the compaction of the accepted rows for that batch, must leave the KV cache, the linear-attention states and `logits_output.hidden_states` as the default code would, and returns a `VerifyAcceptResult(next_token_ids, accept_lens, new_seq_lens, bonus_tokens)` in the default code's layout. Pass it only for the batches the step handles (for example greedy ones). |
+| `run_eagle_verify(..., accept_step: Optional[VerifyAcceptStep])` | `None`: sglang's sampling and acceptance | Once per verified batch, on the forward stream, right after the target verify forward, as `accept_step(batch, logits_output, can_run_cuda_graph)`. It replaces sampling, acceptance, the state commit, the KV move of the accepted path and the compaction of the accepted rows for that batch, must leave the KV cache, the linear-attention states and `logits_output.hidden_states` as the default code would, and returns a `VerifyAcceptResult(next_token_ids, accept_lens, new_seq_lens, bonus_tokens)` in the default code's layout. Pass it only for the batches the step handles: `run_eagle_verify` raises `ValueError` for a batch that needs grammar, logprobs, non-greedy sampling, penalties or a logit bias. |
 
 ## Algorithm configuration
 

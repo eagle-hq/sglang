@@ -585,6 +585,32 @@ VerifyAcceptStep = Callable[
 ]
 
 
+def _check_accept_step_batch(batch: ScheduleBatch) -> None:
+    """An accept step replaces sampling, so it must not get a batch whose
+    requests need what only sglang's accept code applies."""
+    sampling = batch.sampling_info
+    needs = [
+        name
+        for name, used in (
+            ("grammar", batch.has_grammar),
+            ("logprobs", batch.return_logprob),
+            ("non-greedy sampling", not sampling.is_all_greedy),
+            (
+                "penalties",
+                sampling.acc_additive_penalties is not None
+                or sampling.acc_scaling_penalties is not None,
+            ),
+            ("logit bias", sampling.logit_bias is not None),
+        )
+        if used
+    ]
+    if needs:
+        raise ValueError(
+            f"accept_step cannot serve a batch that needs {', '.join(needs)}; "
+            "run that batch with accept_step=None"
+        )
+
+
 def run_eagle_verify(
     batch: ScheduleBatch,
     *,
@@ -619,11 +645,14 @@ def run_eagle_verify(
     target forward for this batch: sampling, acceptance, the state commit, the
     KV move of the accepted path and the compaction of the accepted rows. It is
     called once, on the forward stream, right after the target verify forward,
-    with ``(batch, logits_output, can_run_cuda_graph)``. It must leave the KV
-    cache, the linear-attention states and ``logits_output.hidden_states`` as
-    the default accept code would, and return the accepted tokens. None (the
-    default) runs sglang's accept code.
+    with ``(batch, logits_output, can_run_cuda_graph)``, and only for an
+    all-greedy batch without grammar, logprobs, penalties or logit bias (else
+    ValueError). It must leave the KV cache, the linear-attention states and
+    ``logits_output.hidden_states`` as the default accept code would, and
+    return the accepted tokens. None (the default) runs sglang's accept code.
     """
+    if accept_step is not None:
+        _check_accept_step_batch(batch)
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)

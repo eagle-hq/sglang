@@ -89,8 +89,8 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
-    # Newer FlashInfer lets forward() write into a caller's output instead of
-    # a zero-filled one.
+    # A FlashInfer whose forward() takes `out` writes into a caller's output
+    # instead of a zero-filled one (no release has it yet).
     _PAGED_PREFILL_FORWARD_TAKES_OUT = (
         "out"
         in inspect.signature(BatchPrefillWithPagedKVCacheWrapper.forward).parameters

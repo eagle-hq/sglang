@@ -2,7 +2,7 @@
 
 A speculative algorithm can replace the two state updates of a GDN target
 verify forward, the causal conv1d and the gated delta recurrence, with its own
-kernels (for example a verify over a non-chain draft layout). Its
+kernels (for example faster kernels for its own draft layout). Its
 ``create_linear_attn_verify_extension(state)`` gets the backend's
 ``LinearAttnStateLayout`` and returns a ``LinearAttnVerifyExtension`` or None.
 The backend calls the extension at the points below; every method defaults to
