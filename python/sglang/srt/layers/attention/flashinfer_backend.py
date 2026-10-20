@@ -554,6 +554,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        if not skip_prefill and not self.use_paged:
+            # Prefix-free graph capture never exercises the ragged/paged merge.
+            num_heads = (
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
+            )
+            value = torch.zeros(
+                (1, num_heads, model_runner.model_config.v_head_dim),
+                dtype=model_runner.dtype,
+                device=model_runner.device,
+            )
+            lse = torch.zeros(
+                (1, num_heads), dtype=torch.float32, device=model_runner.device
+            )
+            _safe_merge_state(value, lse, value, lse)
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
