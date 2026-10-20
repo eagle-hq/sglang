@@ -91,6 +91,7 @@ class TestDefaults(CustomTestCase):
                 size=4, mamba_pool=SimpleNamespace(mamba_cache=mamba_cache)
             ),
             device="cpu",
+            server_args=SimpleNamespace(disable_radix_cache=False, pp_size=1),
             spec_algorithm=SimpleNamespace(create_linear_attn_verify_extension=create),
         )
 
@@ -135,6 +136,8 @@ class TestDefaults(CustomTestCase):
                     num_v_heads=6,
                     has_state_snapshots=True,
                     device=torch.device("cpu"),
+                    snapshot_shape=(1,),
+                    can_commit_state=False,
                 )
             ],
         )

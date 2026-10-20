@@ -44,6 +44,9 @@ class LinearAttnStateLayout:
     head_dim: Optional[int] = None
     ssm_state_size: Optional[int] = None
     n_groups: Optional[int] = None
+    # Records-based commits are allowed only without radix tracking or PP overlap.
+    snapshot_shape: tuple[int, ...] = ()
+    can_commit_state: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,6 +89,23 @@ class LinearAttnVerifyExtension:
         / ``key`` / ``value`` keep their ``(1, tokens, heads, dim)`` shape,
         ``a`` / ``b`` their ``(tokens, heads)`` shape). Asked after
         ``begin_forward``; default False."""
+        return False
+
+    def commit_state(
+        self,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        record_indices: torch.Tensor,
+        commit_steps: torch.Tensor,
+        parent: torch.Tensor,
+    ) -> bool:
+        """Commit accepted recurrent states from extension-owned records.
+
+        Called only when the creation layout allows independent commits, with
+        live tree metadata (including graph replays). Return True to skip SSM
+        snapshot scatter; convolution and auxiliary state still commit normally.
+        No CPU reads or synchronizations are permitted here.
+        """
         return False
 
     def conv_update(
