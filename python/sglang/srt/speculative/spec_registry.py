@@ -206,11 +206,12 @@ class CustomSpecAlgo:
     def create_linear_attn_verify_extension(
         self, state: LinearAttnStateLayout
     ) -> Optional[LinearAttnVerifyExtension]:
-        """Target-verify extension for a GDN linear-attention backend with
-        this ``state`` (see ``layers/attention/linear/verify_extension.py``):
-        replace the verify conv1d and recurrence with your own kernels, for
-        example a verify over a non-chain draft layout. Called once per GDN
-        backend. ``None`` (the default) keeps the backend's kernels."""
+        """Target-verify extension for a GDN or Mamba2 linear-attention
+        backend with this ``state`` (``state.kind``; see
+        ``layers/attention/linear/verify_extension.py``): replace the verify
+        conv1d and recurrence with your own kernels, for example a verify over
+        a non-chain draft layout. Called once per backend. ``None`` (the
+        default) keeps the backend's kernels."""
         return None
 
     def resolve_max_speculative_num_draft_tokens(

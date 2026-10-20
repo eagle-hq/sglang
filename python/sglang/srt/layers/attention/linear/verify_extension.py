@@ -1,13 +1,14 @@
-"""Speculative target-verify extension of the GDN linear-attention backend.
+"""Speculative target-verify extension of the linear-attention backends.
 
-A speculative algorithm can replace the two state updates of a GDN target
-verify forward, the causal conv1d and the gated delta recurrence, with its own
-kernels (for example faster kernels for its own draft layout). Its
+A speculative algorithm can replace the two state updates of a target verify
+forward with its own kernels (for example faster kernels for its own draft
+layout): the causal conv1d and, for GDN, the gated delta recurrence or, for
+Mamba2, the selective state update. Its
 ``create_linear_attn_verify_extension(state)`` gets the backend's
-``LinearAttnStateLayout`` and returns a ``LinearAttnVerifyExtension`` or None.
-The backend calls the extension at the points below; every method defaults to
-"not handled", so the backend runs its own kernels. Without an extension
-(every builtin) nothing changes.
+``LinearAttnStateLayout`` (``kind`` names the mixer) and returns a
+``LinearAttnVerifyExtension`` or None. The backend calls the extension at the
+points below; every method defaults to "not handled", so the backend runs its
+own kernels. Without an extension (every builtin) nothing changes.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
     from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 
 
@@ -28,7 +30,7 @@ class LinearAttnStateLayout:
     # Conv state width (conv kernel size - 1) and dtype.
     conv_state_len: int
     conv_dtype: torch.dtype
-    # Recurrent state dtype and value heads per rank.
+    # Recurrent state dtype and value heads per rank (Mamba2: heads per rank).
     ssm_dtype: torch.dtype
     num_v_heads: int
     # Per-step state snapshots (intermediate_ssm), which the post-verify
@@ -36,6 +38,12 @@ class LinearAttnStateLayout:
     # picks another path for a forward raises when an extension is set.
     has_state_snapshots: bool
     device: torch.device
+    # The mixer: "gdn" or "mamba2".
+    kind: str = "gdn"
+    # Mamba2 only: head dim, SSM state size and B/C groups per rank.
+    head_dim: Optional[int] = None
+    ssm_state_size: Optional[int] = None
+    n_groups: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,7 +90,7 @@ class LinearAttnVerifyExtension:
 
     def conv_update(
         self,
-        layer: RadixLinearAttention,
+        layer: RadixLinearAttention | MambaMixer2,
         mixed_qkv: torch.Tensor,
         *,
         conv_states: torch.Tensor,
@@ -90,9 +98,10 @@ class LinearAttnVerifyExtension:
         intermediate_conv_window: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Target-verify conv1d. ``mixed_qkv`` is ``(batch, dim, width)``.
-        Return the conv output in the same layout, or None to run the
-        backend's ``causal_conv1d_update``."""
+        """Target-verify conv1d. ``mixed_qkv`` is ``(batch, dim, width)``
+        (Mamba2: the x / B / C projection before the conv). Return the conv
+        output in the same layout, or None to run the backend's
+        ``causal_conv1d_update``."""
         return None
 
     def recurrent_update(
@@ -115,3 +124,32 @@ class LinearAttnVerifyExtension:
         commit works unchanged. Return the attention output, or None to run
         the backend's ``target_verify`` kernel."""
         return None
+
+    def ssm_update(
+        self,
+        layer: MambaMixer2,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        out: torch.Tensor,
+        intermediate_states: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+    ) -> bool:
+        """Mamba2 target-verify selective state update, with the inputs of
+        the backend's ``selective_state_update`` call: ``x`` and ``dt``
+        ``(batch, width, heads, head_dim)``, ``B`` and ``C`` ``(batch, width,
+        n_groups, state)``, ``A`` ``(heads, head_dim, state)`` in fp32, ``D``
+        and ``dt_bias`` ``(heads, head_dim)``; ``dt`` is before
+        ``softplus(dt + dt_bias)``. Write the outputs into ``out`` ``(batch,
+        width, heads, head_dim)`` and the per-token states into
+        ``intermediate_states`` at its own per-slot step pitch, like the
+        backend's kernel, so the post-verify commit works unchanged; return
+        True. Return False to run the backend's kernel."""
+        return False

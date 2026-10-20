@@ -277,8 +277,8 @@ class SpeculativeAlgorithm(Enum):
     def create_linear_attn_verify_extension(
         self, state: LinearAttnStateLayout
     ) -> Optional[LinearAttnVerifyExtension]:
-        """Target-verify extension for a GDN linear-attention backend;
-        builtins run the backend's own verify kernels."""
+        """Target-verify extension for a GDN or Mamba2 linear-attention
+        backend; builtins run the backend's own verify kernels."""
         return None
 
     def need_topk(self) -> bool:
