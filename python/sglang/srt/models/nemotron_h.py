@@ -867,9 +867,9 @@ class NemotronHModel(nn.Module):
             self.norm_f = PPMissingLayer(return_tuple=True)
         self.layers_to_capture: set[int] = set()
 
-    @property
-    def supports_hybrid_prefill_graph(self) -> bool:
-        return is_sm120()
+    # The breakable prefill graph runs the attention and Mamba2 layers in its
+    # breaks and the MoE layers through their MoE handler, on every GPU.
+    supports_hybrid_prefill_graph = True
 
     def forward(
         self,
