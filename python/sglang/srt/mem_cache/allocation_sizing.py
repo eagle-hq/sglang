@@ -113,4 +113,5 @@ def get_req_to_token_extra_context_len() -> int:
             # UNO's double-buffer reserve applies at every page size. Larger
             # pages may additionally round the allocation up by page_size - 1.
             extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
+        extra = max(extra, spec_algo.req_to_token_extra_len(page_size))
     return extra
