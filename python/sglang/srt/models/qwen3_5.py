@@ -1850,12 +1850,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
-            packed = 0
-            for module in self.modules():
-                if isinstance(module, Qwen3_5GatedDeltaNet):
-                    module.finalize_fused_in_proj()
-                    packed += int(module._fused_in_proj_weight is not None)
+        packed = 0
+        for module in self.modules():
+            if isinstance(module, Qwen3_5GatedDeltaNet):
+                module.finalize_fused_in_proj()
+                packed += int(module._fused_in_proj_weight is not None)
+        if packed:
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
@@ -2383,6 +2383,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        prepare = getattr(self.model, "prepare_before_cuda_graph_capture", None)
+        if prepare is not None:
+            prepare(model_runner)
 
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
