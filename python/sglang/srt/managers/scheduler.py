@@ -4641,7 +4641,9 @@ class Scheduler(
                         fwd_kwargs = {}
                         if not batch.spec_algorithm.is_none():
                             fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
+                                self.future_map.publish,
+                                future_indices,
+                                future_indices_cpu=batch.req_pool_indices_cpu,
                             )
                             # Grammar-overlap-capable workers advance the grammar FSM
                             # inside verify() before building the bitmask; hand them the

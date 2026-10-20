@@ -304,6 +304,13 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
+        # Host mirror of new_seq_lens_buf for rows whose publisher committed a
+        # host-known token count (plain one-token decode); resolve skips the
+        # D2H pull, and the host sync behind it, when every row is known.
+        self.new_seq_lens_host = torch.empty((self.req_pool_size,), dtype=torch.int64)
+        self.new_seq_lens_host_known = torch.zeros(
+            (self.req_pool_size,), dtype=torch.bool
+        )
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -581,6 +588,14 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
+        idx_cpu = batch.req_pool_indices_cpu
+        if bool(self.new_seq_lens_host_known[idx_cpu].all()):
+            batch.seq_lens_cpu = self.new_seq_lens_host[idx_cpu]
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+            return
+
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -608,7 +623,11 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        future_indices_cpu: Optional[torch.Tensor] = None,
+        new_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
+        """Relay the committed lengths; `new_seq_lens_cpu` (with
+        `future_indices_cpu`) when the publisher knows them on host."""
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
@@ -622,6 +641,16 @@ class FutureMap:
                 self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
+            if future_indices_cpu is None:
+                # Rows unknown: any host mirror row may now be stale.
+                self.new_seq_lens_host_known.fill_(False)
+            elif new_seq_lens_cpu is None:
+                self.new_seq_lens_host_known[future_indices_cpu] = False
+            else:
+                self.new_seq_lens_host[future_indices_cpu] = new_seq_lens_cpu.to(
+                    torch.int64
+                )
+                self.new_seq_lens_host_known[future_indices_cpu] = True
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
