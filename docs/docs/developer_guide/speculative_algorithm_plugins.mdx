@@ -1,0 +1,38 @@
+---
+title: "Add an out-of-tree speculative algorithm"
+description: "Register a speculative decoding algorithm from a plugin package and use the scheduler hooks it can override."
+---
+
+A speculative algorithm plugin adds a new `--speculative-algorithm` value without changing SGLang. The plugin registers the algorithm by name, returns its worker class, and overrides the hooks below. Every hook defaults to the builtin behavior, so builtin algorithms behave the same whether or not a plugin is installed.
+
+## Register the algorithm
+
+Register the algorithm from a general plugin entry point (group `sglang.srt.plugins`, see [Plugin Type 2: General Plugin](/docs/hardware-platforms/plugin#plugin-type-2-general-plugin)). `load_plugins()` runs it in every SGLang process before server arguments are resolved.
+
+```python
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+class MySpecAlgo(CustomSpecAlgo):
+    """Override algorithm-level hooks here."""
+
+def register():
+    @SpeculativeAlgorithm.register("MY_SPEC", spec_class=MySpecAlgo)
+    def _factory(server_args):
+        from my_package.worker import MySpecWorker  # a BaseSpecWorker subclass
+
+        return MySpecWorker
+```
+
+Start the server with `--speculative-algorithm MY_SPEC`.
+
+The worker class subclasses `BaseSpecWorker`. Its scheduler-facing methods (`forward_batch_generation`, `note_request_finished`, `on_verify_complete_cpu`, `activate_step_by_batch`) are the worker side of the contract.
+
+## Algorithm hooks
+
+Override these on the `CustomSpecAlgo` subclass passed as `spec_class`. Builtin algorithms implement the same methods, so the scheduler calls them without type checks.
+
+| Hook | Default | Called |
+|---|---|---|
+| `supports_mm_inputs(self) -> bool` | `True` | By the default `validate_request`, and by the server warmup, which sends a text-only request when this is `False`. |
+| `validate_request(self, req, *, has_mm_inputs: bool, enable_overlap: bool) -> Optional[str]` | Rejects multimodal requests when `supports_mm_inputs()` is `False`; otherwise `None` | Once per request on admission. A returned message aborts the request with it. `has_mm_inputs` reports images, audio or video, which `req` does not hold yet. Call `super().validate_request(...)` from an override to keep the multimodal check. |

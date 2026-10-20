@@ -185,6 +185,27 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         self.assertIs(v2.create_worker(server_args), MagicMock)
 
+    def test_mm_requests_rejected_only_when_unsupported(self):
+        """The default validate_request turns supports_mm_inputs()=False into a
+        rejection of multimodal requests, and admits text-only ones."""
+        kwargs = dict(enable_overlap=False)
+        self.assertIsNone(
+            self.algo.validate_request(None, has_mm_inputs=True, **kwargs)
+        )
+
+        class _TextOnly(CustomSpecAlgo):
+            def supports_mm_inputs(self):
+                return False
+
+        text_only = _TextOnly("MY_TEXT", factory=MagicMock())
+        self.assertIsNone(
+            text_only.validate_request(None, has_mm_inputs=False, **kwargs)
+        )
+        self.assertIn(
+            "multimodal",
+            text_only.validate_request(None, has_mm_inputs=True, **kwargs),
+        )
+
     def test_create_worker_calls_factory(self):
         server_args = MagicMock()
         server_args.disable_overlap_schedule = True
