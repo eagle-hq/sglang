@@ -2335,7 +2335,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
-    json_data = {
+    json_data: Dict[str, Any] = {
         "sampling_params": {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
@@ -2416,14 +2416,31 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
-            assert res.status_code == 200, f"{res.text}"
+            warmup_requests = [json_data]
+            if (
+                request_name in ("/generate", "/v1/chat/completions")
+                and not get_observability().debug_tensor_dump_input_file
+            ):
+                # Greedy decoding does not compile the sampling kernels.
+                sampled_data = json_data.copy()
+                if request_name == "/generate":
+                    sampled_data["sampling_params"] = {
+                        **json_data["sampling_params"],
+                        "temperature": 1.0,
+                        "top_p": 0.9,
+                    }
+                else:
+                    sampled_data.update(temperature=1.0, top_p=0.9)
+                warmup_requests.append(sampled_data)
+            for warmup_request in warmup_requests:
+                res = requests.post(
+                    url + request_name,
+                    json=warmup_request,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
