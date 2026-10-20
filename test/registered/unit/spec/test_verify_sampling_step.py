@@ -77,7 +77,7 @@ def test_probability_sampler_sees_filtered_targets_and_returns_bonus_lengths():
         result = utils.eagle_sample(
             verify,
             batch,
-            SimpleNamespace(next_token_logits=logits.clone()),
+            SimpleNamespace(next_token_logits=logits.clone(), next_token_ids=None),
             sampling_step=sample,
         )
     assert len(observed) == 1

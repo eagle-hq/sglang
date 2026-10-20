@@ -789,6 +789,39 @@ VerifySamplingStep = Callable[
 ]
 
 
+def check_greedy_ids_batch(
+    batch: ScheduleBatch, grammar_mask, watermark_state: Optional[WatermarkState]
+) -> None:
+    """A verify forward that returned greedy ids (no logits) can only serve
+    an all-greedy batch whose requests need nothing applied to the logits."""
+    sampling_info = batch.sampling_info
+    needs = [
+        name
+        for name, used in (
+            ("non-greedy sampling", not sampling_info.is_all_greedy),
+            ("logprobs", batch.return_logprob),
+            ("a grammar", grammar_mask is not None),
+            (
+                "penalties",
+                sampling_info.acc_additive_penalties is not None
+                or sampling_info.acc_scaling_penalties is not None,
+            ),
+            ("logit bias", sampling_info.logit_bias is not None),
+            (
+                "a watermark",
+                watermark_state is not None
+                and sampling_info.has_watermark_candidates,
+            ),
+        )
+        if used
+    ]
+    if needs:
+        raise ValueError(
+            "the verify forward returned greedy ids (greedy_tokens_only) for a "
+            f"batch that needs {', '.join(needs)} from the logits"
+        )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -836,8 +869,13 @@ def eagle_sample(
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
-
-    sanitize_nan_logits(next_token_logits, "verify: target model logits")
+    # The verify forward returned the rows' greedy ids instead of their logits
+    # (SpecInput.greedy_tokens_only): nothing to penalize, mask or sample.
+    next_token_ids = logits_output.next_token_ids
+    if next_token_ids is not None:
+        check_greedy_ids_batch(batch, grammar_mask, watermark_state)
+    else:
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     # Apply penalties for the committed prefix. History-dependent penalties
     # restrict acceptance to the root below.
@@ -908,8 +946,9 @@ def eagle_sample(
             )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+    predict = torch.zeros(
+        bs * verify_input.draft_token_num, dtype=torch.int32, device=device
+    )
     accept_index = torch.full(
         (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
     )
@@ -918,7 +957,7 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if sampling_info.is_all_greedy or (
+    if next_token_ids is not None or sampling_info.is_all_greedy or (
         sampling_step is None
         and _verify_uses_greedy(
             is_all_greedy=sampling_info.is_all_greedy,
@@ -928,8 +967,9 @@ def eagle_sample(
             use_rejection_sampling=use_rejection_sampling,
         )
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if next_token_ids is None:
+            next_token_ids = torch.argmax(next_token_logits, dim=-1)
+        target_predict = next_token_ids.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
