@@ -248,6 +248,67 @@ class TestCaptureOneShape(CustomTestCase):
         self.assertEqual(runner._captured_graph_variants, {(2, "w2")})
 
 
+class TestDecodeFallback(CustomTestCase):
+    def test_decode_capture_plans_metadata_in_decode_mode(self):
+        variant = DecodeGraphVariant("decode", 1, ForwardMode.DECODE)
+        provider = _Widths()
+        runner = _bare_runner(provider)
+        fb = SimpleNamespace(
+            spec_info=None, lora_ids=None, forward_mode=ForwardMode.DECODE
+        )
+        runner.capture_prepare = mock.Mock(return_value=(fb, runner.attn_backend, None))
+        modes = []
+        provider.begin_capture = lambda v, batch, backend, stream_idx: (
+            modes.append(batch.forward_mode) or backend
+        )
+        with (
+            mock.patch.object(
+                mod,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(debug_cuda_graph=False)
+                ),
+            ),
+            mock.patch.object(mod, "maybe_flashinfer_autotune_speculative_draft"),
+        ):
+            runner.capture_one_shape(2, forward=None, spec_variant=variant)
+        runner.capture_prepare.assert_called_once_with(
+            2, stream_idx=None, num_tokens=2, forward_mode=ForwardMode.DECODE
+        )
+        self.assertEqual(modes, [ForwardMode.DECODE])
+        runner.attn_backend.init_forward_metadata_out_graph.assert_called_once_with(
+            fb, in_capture=True
+        )
+        self.assertEqual(
+            runner.backend.capture_one.call_args.args[0],
+            ShapeKey(size=2, spec_variant="decode"),
+        )
+
+    def test_decode_variant_plans_decode_not_target_verify(self):
+        variant = DecodeGraphVariant("decode", 1, ForwardMode.DECODE)
+        provider = _Widths()
+        provider.replay_variant = lambda forward_batch: variant
+        runner = _bare_runner(provider)
+        runner._captured_graph_variants = {(1, "decode")}
+        runner.buffers = SimpleNamespace(custom_mask=None, num_token_non_padded=None)
+        runner.buffer_registry = mock.MagicMock()
+        runner._validate_capture_hidden_mode = lambda fb: None
+        fb = _verify_batch(1, 1)
+        fb.forward_mode = ForwardMode.DECODE
+        fb.spec_info = None
+        views = []
+        with mock.patch.object(
+            mod,
+            "build_replay_fb_view",
+            side_effect=lambda **kw: views.append(kw) or SimpleNamespace(**kw),
+        ):
+            self.assertTrue(runner.can_run_graph(fb))
+            runner.load_batch(fb)
+        self.assertEqual(views[0]["capture_forward_mode"], ForwardMode.DECODE)
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        self.assertFalse(runner.can_run_graph(fb))
+
+
 class TestReplay(CustomTestCase):
     def test_can_run_only_captured_variants(self):
         runner = _bare_runner(_Widths())

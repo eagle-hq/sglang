@@ -780,6 +780,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # captured for that variant.
             spec_variant = self.graph_variants.replay_variant(forward_batch)
             self._replay_spec_variant = spec_variant
+            if (
+                spec_variant is not None
+                and spec_variant.forward_mode is not None
+                and forward_batch.forward_mode != spec_variant.forward_mode
+            ):
+                return False
             if spec_variant is None or (
                 forward_batch.input_ids.shape[0]
                 != forward_batch.batch_size * spec_variant.num_tokens_per_req
@@ -1021,6 +1027,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        forward_mode: Optional[ForwardMode] = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -1033,6 +1040,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         pp_proxy_tensors is None unless pp_size > 1.
         """
         bs = size
+        if forward_mode is None:
+            forward_mode = self.capture_forward_mode
         buffers: DecodeInputBuffers = self.buffers
         if num_tokens is None:
             num_tokens = bs * self.captured_req_width
@@ -1129,7 +1138,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
         forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
+            forward_mode=forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -1162,7 +1171,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 buffers.num_token_non_padded if enable_num_token_non_padded() else None
             ),
             attn_tp_sequence_sharded=attn_tp_sharded,
-            global_forward_mode=self.capture_forward_mode,
+            global_forward_mode=forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
@@ -1350,8 +1359,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
+        capture_args = {}
+        if spec_variant is not None and spec_variant.forward_mode is not None:
+            capture_args["forward_mode"] = spec_variant.forward_mode
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs, stream_idx=stream_idx, num_tokens=num_tokens, **capture_args
         )
         if spec_variant is not None:
             attn_backend = self.graph_variants.begin_capture(
@@ -1498,6 +1510,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         is_ragged = ragged_layout is not None
         spec_variant = self._replay_spec_variant
+        replay_forward_mode = (
+            spec_variant.forward_mode
+            if spec_variant is not None and spec_variant.forward_mode is not None
+            else self.capture_forward_mode
+        )
         # Tokens per request of the graph this batch replays.
         replay_req_width = (
             self.captured_req_width
@@ -1628,7 +1645,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._set_dp_real_num_tokens(raw_num_token)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
-                forward_mode=self.capture_forward_mode,
+                forward_mode=replay_forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
@@ -1656,7 +1673,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_tokens=padded_num_tokens,
             global_num_tokens_cpu=self._global_num_tokens_for_graph(padded_num_tokens),
             seq_len_fill_value=self.seq_len_fill_value,
-            capture_forward_mode=self.capture_forward_mode,
+            capture_forward_mode=replay_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
         if (
@@ -1688,7 +1705,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 fb_view,
                 (
                     bs,
-                    str(self.capture_forward_mode),
+                    str(replay_forward_mode),
                     str(fb_view.actual_forward_mode),
                 ),
             )
