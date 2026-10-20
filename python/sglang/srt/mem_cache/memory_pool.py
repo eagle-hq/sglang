@@ -500,6 +500,17 @@ class ReqToTokenPool:
             )
 
 
+def _zero_state_slots(t: torch.Tensor, indices: torch.Tensor) -> None:
+    """Zero ``t[:, indices]`` without a host round trip.
+
+    ``t[:, indices] = 0`` puts a host scalar, which costs a pageable host-to-device
+    copy and a stream sync on every call; a zero made on the device does not.
+    """
+    t[:, indices] = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+        t.shape[0], indices.shape[0], *t.shape[2:]
+    )
+
+
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
 
@@ -1152,21 +1163,12 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                _zero_state_slots(temporal, indices)
             return
         if not _is_npu:
-            need_size = len(indices)
-            for i in range(len(self.mamba_cache.conv)):
-                t = self.mamba_cache.conv[i]
-                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                    t.shape[0], need_size, *t.shape[2:]
-                )
-                t[:, indices] = z
-            t = self.mamba_cache.temporal
-            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                t.shape[0], need_size, *t.shape[2:]
-            )
-            t[:, indices] = z
+            for t in self.mamba_cache.conv:
+                _zero_state_slots(t, indices)
+            _zero_state_slots(self.mamba_cache.temporal, indices)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 t = self.mamba_cache.conv[i]
