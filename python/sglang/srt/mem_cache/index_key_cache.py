@@ -7,6 +7,12 @@ import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
+
+_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -56,52 +62,37 @@ class IndexKeyCache:
         del self.buffer
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        """Copy the index-K entries (fp8 key and scales) of token slots
-        ``src_loc`` to ``tgt_loc``. Rows of the buffer are pages, not tokens, so
-        move each token's byte ranges instead of whole rows."""
         if tgt_loc.numel() == 0:
             return
-        if self.pool.page_size == 1:
-            # A row is one token's entry in every layout.
-            tgt_loc_flat = tgt_loc.view(-1).long()
-            src_loc_flat = src_loc.view(-1).long()
-            for index_k in self.buffer:
-                if index_k.shape[0] == 0:
-                    continue
-                index_k[tgt_loc_flat] = index_k[src_loc_flat]
-            return
-        if (
-            index_buf_accessor._use_aiter_preshuffle
-            or self.pool.index_page_size != self.pool.page_size
-        ):
-            raise NotImplementedError(
-                "index-K move on the preshuffled, k-pooled or context-parallel layout"
-            )
-        tgt_bytes = self._token_byte_indices(tgt_loc.view(-1).long())
-        src_bytes = self._token_byte_indices(src_loc.view(-1).long())
+        assert self.pool.index_kpool == 1, (
+            "Moving pooled index keys requires regrouping tokens"
+        )
+        page_size = self.pool.index_page_size
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        tgt_page, tgt_offset = tgt_loc_flat // page_size, tgt_loc_flat % page_size
+        src_page, src_offset = src_loc_flat // page_size, src_loc_flat % page_size
+        key_bytes = page_size * self.pool.index_head_dim
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue
-            flat = index_k.view(-1)
-            flat[tgt_bytes] = flat[src_bytes]
-
-    def _token_byte_indices(self, loc: torch.Tensor) -> torch.Tensor:
-        """Flat byte offsets of the key and scale bytes of each token slot.
-
-        A page holds ``page_size`` fp8 keys of ``index_head_dim`` bytes,
-        followed by their scales (``index_head_dim // quant_block_size`` fp32
-        values per token)."""
-        pool = self.pool
-        page_size = pool.page_size
-        key_bytes = pool.index_head_dim
-        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
-        page_start = loc // page_size * page_size * (key_bytes + scale_bytes)
-        slot = loc % page_size
-        key_start = page_start + slot * key_bytes
-        scale_start = page_start + page_size * key_bytes + slot * scale_bytes
-        key = key_start[:, None] + torch.arange(key_bytes, device=loc.device)
-        scale = scale_start[:, None] + torch.arange(scale_bytes, device=loc.device)
-        return torch.cat([key, scale], dim=1).view(-1)
+            index_k = self._kernel_view(index_k)
+            # Each physical page stores all key bytes followed by all scale bytes.
+            # Locations identify tokens; copying whole pages overwrites neighbors.
+            keys = index_k[:, :key_bytes]
+            if _use_aiter_preshuffle:
+                tile = INDEXER_K_CACHE_PRESHUFFLE_TILE
+                keys = keys.view(
+                    index_k.shape[0], page_size // tile, -1, tile, tile
+                ).permute(0, 1, 3, 2, 4)
+                keys[tgt_page, tgt_offset // tile, tgt_offset % tile] = keys[
+                    src_page, src_offset // tile, src_offset % tile
+                ]
+            else:
+                keys = keys.view(index_k.shape[0], page_size, -1)
+                keys[tgt_page, tgt_offset] = keys[src_page, src_offset]
+            scales = index_k[:, key_bytes:].view(index_k.shape[0], page_size, -1)
+            scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:

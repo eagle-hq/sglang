@@ -706,6 +706,47 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _filter_verify_target_probs(
+    probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+    *,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+) -> torch.Tensor:
+    """The distribution the sampler draws each verify row's token from.
+
+    This is what Sampler draws without speculation: the top-k and the top-p
+    cut both apply to the unfiltered probabilities (the joint support of
+    top_k_top_p_sampling_from_probs and of the pytorch backend), then min-p
+    drops what is below min_p times the most likely token's probability, and
+    the rest is renormalized. Cutting top-p after a top-k renorm instead keeps
+    fewer tokens whenever the top-k cut binds, and ignoring min-p keeps tokens
+    the sampler never draws: either way speculative decoding stops matching
+    the target model's sampling distribution.
+    """
+
+    def per_row(values: torch.Tensor) -> torch.Tensor:
+        return torch.repeat_interleave(values, draft_token_num, dim=0)
+
+    keep = None
+    if sampling_info.need_top_k_sampling:
+        keep = top_k_renorm_prob(probs, per_row(sampling_info.top_ks)) > 0
+    if sampling_info.need_top_p_sampling:
+        top_p_keep = top_p_renorm_prob(probs, per_row(sampling_info.top_ps)) > 0
+        keep = top_p_keep if keep is None else keep & top_p_keep
+    if sampling_info.need_min_p_sampling:
+        threshold = probs.amax(dim=-1, keepdim=True) * per_row(
+            sampling_info.min_ps
+        ).view(-1, 1)
+        min_p_keep = probs >= threshold
+        keep = min_p_keep if keep is None else keep & min_p_keep
+    if keep is None:
+        return probs
+    probs = probs.masked_fill(~keep, 0.0)
+    return probs / probs.sum(dim=-1, keepdim=True)
+
+
 def _verify_uses_greedy(
     *,
     is_all_greedy: bool,
@@ -783,8 +824,8 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Apply penalties for the committed prefix. History-dependent penalties
+    # restrict acceptance to the root below.
     if sampling_info.acc_additive_penalties is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -984,22 +1025,14 @@ def eagle_sample(
             next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        target_probs = _filter_verify_target_probs(
+            target_probs,
+            sampling_info,
+            verify_input.draft_token_num,
+            top_k_renorm_prob=top_k_renorm_prob,
+            top_p_renorm_prob=top_p_renorm_prob,
+        )
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after filtering")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -1098,6 +1131,25 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    # Penalties describe the committed prefix, not each candidate's tree path.
+    # Only the root distribution is exact when a history-dependent penalty is
+    # active. Commit one draw, then let the next round update the history.
+    # Keep the unpenalized path unchanged, including its accepted draft count.
+    if (
+        sampling_info.acc_additive_penalties is not None
+        or sampling_info.acc_scaling_penalties is not None
+    ):
+        for row, req in enumerate(batch.reqs):
+            params = req.sampling_params
+            if (
+                params.frequency_penalty != 0.0
+                or params.presence_penalty != 0.0
+                or params.repetition_penalty != 1.0
+                or params.min_new_tokens > len(req.output_ids)
+            ):
+                num_correct_drafts[row : row + 1].zero_()
+                accept_index[row, 1:].fill_(-1)
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
@@ -1116,8 +1168,7 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Accumulate penalties from the committed tokens.
     if batch.sampling_info.penalizer_orchestrator.is_required:
         batch.cumulate_penalty_output_tokens()
 

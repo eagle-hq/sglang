@@ -108,6 +108,63 @@ class TestDualGemm(CustomTestCase):
             )
         )
 
+    def test_cutedsl_decode_uses_unfused_projection(self):
+        """The fused MLP must not preempt the faster BF16 decode backend."""
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
+        from sglang.srt.layers.quantization import unquant
+
+        with patch.multiple(
+            unquant,
+            _BF16_GEMM_BACKEND=unquant.Bf16GemmBackend.CUTEDSL,
+            _cutedsl_bf16_gemm=cutedsl_bf16_gemm,
+            _use_cutedsl_bf16_gemm=use_cutedsl_bf16_gemm,
+        ):
+            mlp, generator = _make_llama_mlp()
+            x = torch.randn(
+                (16, _HIDDEN_SIZE),
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            self.assertFalse(mlp.dual_gemm.can_run(x, mlp.gate_up_proj))
+            with torch.inference_mode(), get_parallel().override(tp_group=object()):
+                gate_up, _ = mlp.gate_up_proj(x)
+                expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+                actual = mlp(x)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_cutedsl_fallback_preserves_other_fusion_regimes(self):
+        """BF16 routing must not disable FP16, short-K or multi-wave fusion."""
+        from sglang.srt.layers.dual_gemm import DualGemm
+        from sglang.srt.layers.quantization import unquant
+        from sglang.srt.utils import get_device_core_count
+
+        sms = get_device_core_count(torch.cuda.current_device())
+        for dtype, hidden, intermediate, backend in (
+            (torch.float16, 2048, 2048, unquant.Bf16GemmBackend.CUTEDSL),
+            (torch.bfloat16, 1024, 2048, unquant.Bf16GemmBackend.CUTEDSL),
+            (torch.bfloat16, 8192, 128 * sms, unquant.Bf16GemmBackend.CUTEDSL),
+            (torch.bfloat16, 2048, 2048, unquant.Bf16GemmBackend.TORCH),
+        ):
+            with self.subTest(
+                dtype=dtype, hidden=hidden, intermediate=intermediate, backend=backend
+            ):
+                projection = SimpleNamespace(
+                    quant_method=unquant.UnquantizedLinearMethod(),
+                    params_dtype=dtype,
+                    output_partition_sizes=[intermediate, intermediate],
+                )
+                with (
+                    patch.object(unquant, "_BF16_GEMM_BACKEND", backend),
+                    get_parallel().override(tp_rank=0, tp_size=1),
+                ):
+                    dual = DualGemm(projection, projection, hidden)
+                self.assertEqual(dual.mode, DualGemmQuantMode.UNQUANT)
+                self.assertTrue(dual.can_run(torch.empty(16, hidden), projection))
+
     def test_gate_up_lora_wrapper_falls_back(self):
         """Replacing gate/up with a LoRA wrapper must bypass the fused kernel."""
 

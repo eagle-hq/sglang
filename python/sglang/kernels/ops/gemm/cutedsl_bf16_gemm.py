@@ -115,14 +115,6 @@ def _tgv_l2_prefetch_budget(device_index: int) -> Tuple[int, int]:
     return per_cta, max(1, per_clk)
 
 
-def get_tgv_cute_ext_tactic_num() -> int:
-    return len(_TGV_CUTE_EXT_TACTIC_CONFIGS)
-
-
-def get_tgv_cute_ext_default_tactic() -> int:
-    return _TGV_CUTE_EXT_DEFAULT_TACTIC
-
-
 class WorkTileInfo(NamedTuple):
     """Which output tile this CTA processes. Mirrors the original WorkTileInfo."""
 

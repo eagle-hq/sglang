@@ -137,10 +137,6 @@ class PrefillDelayer:
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
 
-        assert not get_schedule().disable_overlap_schedule, (
-            "To use PrefillDelayer, disable_overlap_schedule must be False."
-        )
-
     def _negotiate_should_allow_prefill(
         self,
         local_prefillable: bool,
@@ -181,7 +177,8 @@ class PrefillDelayer:
         )
 
         # Gather global states
-        tp0_info = self._gather_info(
+        info = self._gather_info if self._needs_gather(prev_state) else self._local_info
+        tp0_info = info(
             local_prefillable=local_prefillable,
             local_token_watermark_force_allow=local_token_watermark_force_allow,
             running_batch=running_batch,
@@ -351,6 +348,49 @@ class PrefillDelayer:
         else:
             raise NotImplementedError
 
+    def _needs_gather(self, prev_state: Optional[_State]) -> bool:
+        """Whether the ranks may disagree on this pass's inputs.
+
+        Without DP attention every rank of the TP group holds the same queue,
+        running batch and prefill history, so its local values are TP0's. Two
+        inputs are read per rank and can differ: the token usage behind the
+        low watermark, and the queue trigger's wall-clock cap, which only a
+        delay in progress reads. The choice itself depends only on the
+        config and on earlier decisions, which every rank shares.
+        """
+        return (
+            self.attn_dp_enabled
+            or self._token_usage_low_watermark is not None
+            or (self._queue_trigger_enabled and prev_state is not None)
+        )
+
+    @staticmethod
+    def _pack_info(
+        local_prefillable: bool,
+        local_token_watermark_force_allow: bool,
+        running_batch: int,
+        max_prefill_bs: int,
+        waiting_queue_len: int,
+        queue_timeout_expired: bool,
+        device,
+    ) -> torch.Tensor:
+        return torch.tensor(
+            [
+                int(local_prefillable),
+                int(local_token_watermark_force_allow),
+                running_batch,
+                max_prefill_bs,
+                waiting_queue_len,
+                int(queue_timeout_expired),
+            ],
+            device=device,
+            dtype=torch.int64,
+        )
+
+    def _local_info(self, **info) -> torch.Tensor:
+        """This rank's values in the layout of ``_gather_info``, without a collective."""
+        return self._pack_info(**info, device="cpu").unsqueeze(0)
+
     def _gather_info(
         self,
         local_prefillable: bool,
@@ -360,17 +400,14 @@ class PrefillDelayer:
         waiting_queue_len: int = 0,
         queue_timeout_expired: bool = False,
     ):
-        local_info = torch.tensor(
-            [
-                int(local_prefillable),
-                int(local_token_watermark_force_allow),
-                running_batch,
-                max_prefill_bs,
-                waiting_queue_len,
-                int(queue_timeout_expired),
-            ],
+        local_info = self._pack_info(
+            local_prefillable,
+            local_token_watermark_force_allow,
+            running_batch,
+            max_prefill_bs,
+            waiting_queue_len,
+            queue_timeout_expired,
             device=self._gather_device,
-            dtype=torch.int64,
         )
         all_gather_single(
             self._global_info_buffer.flatten(),

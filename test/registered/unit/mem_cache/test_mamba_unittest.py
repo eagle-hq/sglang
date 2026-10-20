@@ -584,6 +584,56 @@ class TestMamba(unittest.TestCase):
             mamba_cpu_none, "mamba_cpu should be None when mamba_indices=None"
         )
 
+    def test_clear_slots_zeroes_state_without_host_sync(self):
+        """clear_slots zeroes exactly the given slots, on the fused and the
+        per-tensor path, and never synchronizes the device: it runs for every
+        new request, also between launches that must not wait for the GPU."""
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=256,
+                n_groups=2,
+                num_heads=4,
+                head_dim=64,
+                state_size=16,
+                conv_kernel=4,
+            )
+            cache_params = Mamba2CacheParams(shape=shape, layers=[0, 1])
+        pool = HybridReqToTokenPool(
+            size=4,
+            mamba_size=8,
+            mamba_spec_state_size=4,
+            max_context_len=64,
+            device=get_device(),
+            enable_memory_saver=False,
+            cache_params=cache_params,
+            mamba_layer_ids=[0, 1],
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        ).mamba_pool
+        states = [*pool.mamba_cache.conv, pool.mamba_cache.temporal]
+        slots = torch.tensor([1, 5], dtype=torch.int32, device=states[0].device)
+        is_cleared = torch.zeros(states[0].shape[1], dtype=torch.bool)
+        is_cleared[slots.long().cpu()] = True
+
+        for disable_fused in (False, True):
+            with self.subTest(disable_fused=disable_fused):
+                with envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.override(disable_fused):
+                    for t in states:
+                        t.fill_(1)
+                    if states[0].is_cuda:
+                        torch.cuda.synchronize()
+                        torch.cuda.set_sync_debug_mode("error")
+                    try:
+                        pool.clear_slots(slots)
+                    finally:
+                        if states[0].is_cuda:
+                            torch.cuda.set_sync_debug_mode("default")
+                for t in states:
+                    per_slot = t.cpu().float().transpose(0, 1).flatten(1)
+                    self.assertTrue(torch.all(per_slot[is_cleared] == 0))
+                    self.assertTrue(torch.all(per_slot[~is_cleared] == 1))
+
 
 if __name__ == "__main__":
     unittest.main()

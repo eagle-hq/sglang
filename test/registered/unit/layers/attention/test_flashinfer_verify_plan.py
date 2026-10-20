@@ -102,6 +102,21 @@ class TestWidthKeyedVerifyWrappers(CustomTestCase):
         used = backend.indices_updater_prefill.update.call_args.kwargs
         self.assertIs(used["prefill_wrappers"], narrow)
 
+    def test_recapturing_a_width_keeps_the_wrappers_of_earlier_graphs(self):
+        backend, created = _flashinfer_backend()
+        # Two output variants can capture the same attention shape. Each graph
+        # retains its wrapper's plan buffers, so replay must refresh both.
+        backend._prepare_cuda_graph_metadata(1, 4, ForwardMode.TARGET_VERIFY, None)
+        first = backend.forward_metadata.prefill_wrappers
+        backend._prepare_cuda_graph_metadata(1, 2, ForwardMode.TARGET_VERIFY, None)
+        backend._prepare_cuda_graph_metadata(1, 4, ForwardMode.TARGET_VERIFY, None)
+        second = backend.forward_metadata.prefill_wrappers
+        backend.init_forward_metadata_out_graph(_replay_view(1, 4))
+        used = backend.indices_updater_prefill.update.call_args.kwargs
+        self.assertIs(used["prefill_wrappers"], first)
+        self.assertIs(used["prefill_wrappers"], second)
+        self.assertEqual(len(created), 2)
+
     def test_one_width_per_bs_matches_the_bs_keyed_wrappers(self):
         backend, created = _flashinfer_backend()
         backend._prepare_cuda_graph_metadata(2, 8, ForwardMode.TARGET_VERIFY, None)

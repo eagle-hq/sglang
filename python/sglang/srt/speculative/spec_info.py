@@ -277,8 +277,8 @@ class SpeculativeAlgorithm(Enum):
     def create_linear_attn_verify_extension(
         self, state: LinearAttnStateLayout
     ) -> Optional[LinearAttnVerifyExtension]:
-        """Target-verify extension for a GDN linear-attention backend;
-        builtins run the backend's own verify kernels."""
+        """Target-verify extension for a GDN or Mamba2 linear-attention
+        backend; builtins run the backend's own verify kernels."""
         return None
 
     def need_topk(self) -> bool:
@@ -477,6 +477,11 @@ class SpecInput(ABC):
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
 
     # Whether a forward carrying this input reads only the greedy argmax of
     # its rows (an all-greedy verify without logprobs, grammar or penalties).

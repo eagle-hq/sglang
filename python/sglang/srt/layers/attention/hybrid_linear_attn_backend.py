@@ -22,6 +22,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.verify_extension import (
+    LinearAttnStateLayout,
+    LinearAttnVerifyExtension,
+    LinearAttnVerifyLayout,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -34,7 +39,7 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -173,6 +178,8 @@ class MambaAttnBackendBase(AttentionBackend):
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
+        logical_mode = forward_batch.logical_forward_mode
+
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
@@ -216,7 +223,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         replayssm_write_pos = None
         replayssm_force_flush = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if logical_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -277,7 +284,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif logical_mode.is_extend(include_draft_extend_v2=True):
             has_extend_meta = (
                 forward_batch.extend_start_loc is not None
                 and forward_batch.extend_seq_lens is not None
@@ -572,6 +579,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1101,12 +1109,38 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
     needs_cpu_seq_lens: bool = False
+    # Speculative target-verify kernels of the algorithm, if it supplies any
+    # (layers/attention/linear/verify_extension.py).
+    verify_extension: Optional[LinearAttnVerifyExtension] = None
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-        )
+        mamba_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
+        self.conv_states_shape = mamba_cache.conv[0].shape
+        # Only a pool with speculative state runs target verify forwards.
+        if isinstance(mamba_cache, MambaPool.SpeculativeState):
+            # temporal: (layers, slots, heads, head_dim, state); conv:
+            # (layers, slots, heads * head_dim + 2 * groups * state, width).
+            num_heads, head_dim, state_size = mamba_cache.temporal.shape[-3:]
+            conv_dim = self.conv_states_shape[-2]
+            self.verify_extension = (
+                model_runner.spec_algorithm.create_linear_attn_verify_extension(
+                    LinearAttnStateLayout(
+                        conv_state_len=self.conv_states_shape[-1],
+                        conv_dtype=mamba_cache.conv[0].dtype,
+                        ssm_dtype=mamba_cache.temporal.dtype,
+                        num_v_heads=num_heads,
+                        has_state_snapshots=mamba_cache.intermediate_ssm is not None,
+                        device=torch.device(self.device),
+                        kind="mamba2",
+                        head_dim=head_dim,
+                        ssm_state_size=state_size,
+                        n_groups=(conv_dim - num_heads * head_dim) // (2 * state_size),
+                    )
+                )
+            )
+        # The verify layout the extension handles this forward, else None.
+        self._verify_extension_layout: Optional[LinearAttnVerifyLayout] = None
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
@@ -1153,6 +1187,41 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=False)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.verify_extension is not None:
+            self.verify_extension.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        if self.verify_extension is not None:
+            self._begin_verify_extension(forward_batch, in_graph=True)
+
+    def _begin_verify_extension(self, forward_batch: ForwardBatch, *, in_graph: bool):
+        metadata = self.forward_metadata
+        layout = None
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and metadata.retrieve_parent_token is not None
+        ):
+            if self.req_to_token_pool.mamba_pool.mamba_cache.intermediate_ssm is None:
+                raise RuntimeError(
+                    "A linear-attention verify extension needs the per-step "
+                    "state snapshot verify path."
+                )
+            layout = LinearAttnVerifyLayout(
+                next_token=metadata.retrieve_next_token,
+                next_sibling=metadata.retrieve_next_sibling,
+                parent_token=metadata.retrieve_parent_token,
+                cache_indices=metadata.mamba_cache_indices,
+                query_start_loc=metadata.query_start_loc,
+                width=forward_batch.spec_info.draft_token_num,
+            )
+        self._verify_extension_layout = layout
+        self.verify_extension.begin_forward(layout, in_graph=in_graph)
 
     def forward(
         self,
@@ -1178,6 +1247,11 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata=self.forward_metadata,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            verify_extension=(
+                self.verify_extension
+                if self._verify_extension_layout is not None
+                else None
+            ),
         )
 
         if forward_batch.mamba_track_mask is not None:
@@ -1410,6 +1484,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1420,6 +1495,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 num_tokens,
                 req_pool_indices,
                 seq_lens,
+                out_cache_loc,
                 encoder_lens,
                 forward_mode,
                 spec_info,
@@ -1506,13 +1582,21 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
+        # For linear attention, dispatch on the logical mode to match the
+        # built metadata.
+        dispatch_mode = (
+            forward_batch.logical_forward_mode
+            if is_linear_attn
+            else forward_batch.forward_mode
+        )
+
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
+        elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,
                 forward_batch,

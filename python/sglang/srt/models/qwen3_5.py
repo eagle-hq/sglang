@@ -1031,8 +1031,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN and a verify extension
+            # that reads them; DP-relabeled decode rows run the decode kernels,
+            # so pick the layout from the logical mode.
             use_strided_prefill_z = _is_cuda and (
-                forward_batch.forward_mode.is_extend_without_speculative()
+                forward_batch.logical_forward_mode.is_extend_without_speculative()
                 or strided_verify
             )
             split_fn = (

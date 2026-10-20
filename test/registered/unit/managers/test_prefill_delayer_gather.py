@@ -1,3 +1,4 @@
+import contextlib
 import os
 import tempfile
 import time
@@ -68,6 +69,88 @@ class TestPrefillDelayerGather(CustomTestCase):
                     [local + 100 * g * ranks_per_dp_group for g in range(dp_groups)]
                 )
                 self.assertTrue(torch.equal(info, expected), f"{info} != {expected}")
+
+
+def _same_on_every_rank(output, local, group=None):
+    output.view(get_parallel().tp_size, -1).copy_(local)
+
+
+_PASSES = [  # (local_prefillable, running_batch, max_prefill_bs, waiting_queue_len)
+    (True, 8, 4, 1),
+    (True, 126, 4, 3),  # slot condition: delay
+    (True, 126, 4, 3),
+    (False, 126, 4, 0),
+    (True, 126, 4, 3),
+    (True, 10, 2, 2),
+]
+
+
+def _decisions(delayer):
+    out = []
+    for prefillable, running, max_bs, queue in _PASSES:
+        r = delayer._negotiate_should_allow_prefill(
+            local_prefillable=prefillable,
+            token_usage=0.8,
+            running_batch=running,
+            max_prefill_bs=max_bs,
+            max_running_requests=128,
+            waiting_queue_len=queue,
+        )
+        out.append((r.output_allow, r.output_reason, r.input_estimation))
+    return out
+
+
+class TestPrefillDelayerNonOverlapScheduler(CustomTestCase):
+    def _delayer(self, topology="tp", **fields):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(published_topology(**TOPOLOGIES[topology], **fields))
+        stack.enter_context(
+            get_parallel().override(
+                tp_group=SimpleNamespace(
+                    cpu_group=None, device_group="nccl", device="cpu"
+                )
+            )
+        )
+        self.gather = stack.enter_context(
+            patch(
+                "sglang.srt.managers.prefill_delayer.all_gather_single",
+                side_effect=_same_on_every_rank,
+            )
+        )
+        watermark = fields.pop("prefill_delayer_token_usage_low_watermark", None)
+        return PrefillDelayer(max_delay_passes=3, token_usage_low_watermark=watermark)
+
+    def test_runs_on_the_non_overlap_scheduler(self):
+        delayer = self._delayer(disable_overlap_schedule=True)
+        self.assertEqual(delayer._gather_group, "nccl")
+        _decisions(delayer)
+
+    def test_ranks_that_agree_negotiate_without_a_collective(self):
+        local = _decisions(self._delayer(disable_overlap_schedule=True))
+        self.gather.assert_not_called()
+
+        gathered = self._delayer(disable_overlap_schedule=True)
+        with patch.object(gathered, "_needs_gather", return_value=True):
+            self.assertEqual(_decisions(gathered), local)
+        self.assertEqual(self.gather.call_count, len(_PASSES))
+        self.assertIn((False, "delay", "all"), local)
+
+    def test_rank_local_inputs_keep_the_gather(self):
+        for name, delayer in [
+            ("dp_attention", self._delayer("dp_attention")),
+            (
+                "token watermark",
+                self._delayer(prefill_delayer_token_usage_low_watermark=0.5),
+            ),
+        ]:
+            with self.subTest(name):
+                self.assertTrue(delayer._needs_gather(None))
+
+        queue = self._delayer(prefill_delayer_queue_min_ratio=0.5)
+        self.assertFalse(queue._needs_gather(None))
+        # A delay in progress reads the wall-clock cap, which each rank reads.
+        self.assertTrue(queue._needs_gather(_State(delayed_count=1)))
 
 
 def _negotiate_with_skewed_clocks(rank, world_size, init_file):

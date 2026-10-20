@@ -284,6 +284,13 @@ def _verify_backend(extension, bs=1, width=4, tree=True):
 
 
 class TestTargetVerifyExtension(CustomTestCase):
+    def setUp(self):
+        # The inputs are CPU tensors: split q/k/v with torch on every host, as
+        # on a CPU-only one, instead of the Triton kernel CUDA hosts pick.
+        patcher = mock.patch.object(gdn_mod, "is_cuda", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_extension_replaces_conv_and_recurrence(self):
         extension = _Recorder(handle=True)
         backend, layer, fb, mixed_qkv = _verify_backend(extension)

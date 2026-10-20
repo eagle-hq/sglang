@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_device_core_count, is_cuda
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
@@ -37,12 +37,18 @@ class DualGemm:
         if not is_cuda():
             return None
 
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm_routing import (
+            use_cutedsl_bf16_gemm,
+        )
         from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
             MAX_DUAL_GEMM_DECODE_TOKENS,
             DualGemmQuantMode,
             can_use_dual_gemm,
         )
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedLinearMethod,
+            get_bf16_gemm_backend,
+        )
 
         gate_up_method = gate_up_proj.quant_method
         if isinstance(gate_up_method, UnquantizedLinearMethod):
@@ -95,6 +101,22 @@ class DualGemm:
             local_intermediate_size,
             mode,
         ):
+            if (
+                mode == DualGemmQuantMode.UNQUANT
+                and gate_up_proj.params_dtype == torch.bfloat16
+                and get_bf16_gemm_backend().is_cutedsl()
+                and hidden_size >= 2048
+                and use_cutedsl_bf16_gemm(
+                    MAX_DUAL_GEMM_DECODE_TOKENS,
+                    2 * local_intermediate_size,
+                    hidden_size,
+                )
+                and 2 * local_intermediate_size
+                <= 128 * get_device_core_count(torch.cuda.current_device())
+            ):
+                # Cold-weight decode favors TGV + SiLU for a one-wave grid
+                # of 128 output rows/CTA; keep fusion for short K or more waves.
+                return None
             self.max_tokens = MAX_DUAL_GEMM_DECODE_TOKENS
             return mode
         return None
