@@ -85,12 +85,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     # Full load -> RMSNorm variance
     head_offs = tl.arange(0, HEAD_BLOCK)
     head_mask = head_offs < HEAD_DIM
-    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    # PDL: launched behind the QKV projection, the program runs up to here while that GEMM finishes (the norm
-    # weight is not written by it); the activations are read only after the wait.
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
     x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / HEAD_DIM
     inv_rms = tl.rsqrt(var + EPS)
     x_norm = (x * inv_rms * (w + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
@@ -234,7 +230,6 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
-        launch_pdl=_ENABLE_PDL,
     )
 
     return q_out, k_out, gate_out if has_gate else None
