@@ -479,7 +479,11 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     use_aux = get_eagle_config("use_aux_hidden_state", True)
     spec_algorithm = model_runner.spec_algorithm
 
-    if not (spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux):
+    if not (
+        spec_algorithm is not None
+        and spec_algorithm.uses_aux_hidden_states()
+        and use_aux
+    ):
         return model_config.spec_hidden_size
 
     target_hidden = getattr(hf_config, "target_hidden_size", None)

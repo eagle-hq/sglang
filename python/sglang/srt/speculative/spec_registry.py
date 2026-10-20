@@ -76,6 +76,13 @@ class CustomSpecAlgo:
     def is_eagle3(self) -> bool:
         return False
 
+    def uses_aux_hidden_states(self) -> bool:
+        """Whether the target captures auxiliary hidden states for the draft,
+        from the layers the draft's ``eagle_config`` names, and the draft reads
+        their concatenation. Lets an EAGLE-family plugin get only that
+        EAGLE-3 behavior without answering ``is_eagle3()``."""
+        return False
+
     def is_frozen_kv_mtp(self) -> bool:
         return False
 
