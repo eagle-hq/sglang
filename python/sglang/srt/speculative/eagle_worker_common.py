@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
+    VerifySamplingStep,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
@@ -656,6 +657,7 @@ def run_eagle_verify(
     grammar_barrier=None,
     uno_target_max_top_k: Optional[int] = None,
     accept_step: Optional[VerifyAcceptStep] = None,
+    sampling_step: Optional[VerifySamplingStep] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -680,6 +682,8 @@ def run_eagle_verify(
     sglang then commits the linear-attention states of the accepted path and
     builds the result. None (the default) runs sglang's accept code.
     """
+    if accept_step is not None and sampling_step is not None:
+        raise ValueError("accept_step and sampling_step are mutually exclusive")
     if accept_step is not None:
         _check_accept_step_batch(batch, token_to_kv_pool_allocator.get_kvcache())
     fwd_stream = torch.get_device_module(device).current_stream()
@@ -828,6 +832,7 @@ def run_eagle_verify(
         logits_output,
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
+        sampling_step=sampling_step,
         watermark_state=target_worker.model_runner.watermark_state,
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None

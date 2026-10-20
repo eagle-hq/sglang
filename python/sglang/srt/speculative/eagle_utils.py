@@ -4,7 +4,7 @@ import logging
 import math
 from enum import IntEnum
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -783,6 +783,12 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+VerifySamplingStep = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -792,10 +798,19 @@ def eagle_sample(
     *,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
+    sampling_step: Optional[VerifySamplingStep] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
+
+    ``sampling_step`` replaces only non-greedy tree sampling. It receives
+    normalized, filtered target probabilities [B, W, V], independent acceptance
+    uniforms [B, W] and final uniforms [B]. It returns node-indexed predictions
+    [B*W], accept lengths INCLUDING the bonus [B], and global accepted row
+    indices [B, depth] (-1 padded). Runs on the forward stream. The host retains
+    penalties, grammar, logprobs, TP synchronization and state/KV commit.
+    None preserves the native sampling implementation.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -903,12 +918,15 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
-        is_cpu=_is_cpu,
-        is_hip=_is_hip,
-        is_xpu=_is_xpu,
-        use_rejection_sampling=use_rejection_sampling,
+    if sampling_info.is_all_greedy or (
+        sampling_step is None
+        and _verify_uses_greedy(
+            is_all_greedy=sampling_info.is_all_greedy,
+            is_cpu=_is_cpu,
+            is_hip=_is_hip,
+            is_xpu=_is_xpu,
+            use_rejection_sampling=use_rejection_sampling,
+        )
     ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -938,7 +956,7 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
+    elif sampling_step is None and _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
     ):
@@ -1037,12 +1055,14 @@ def eagle_sample(
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
-            else torch.zeros_like(target_probs)
+            else (torch.zeros_like(target_probs) if sampling_step is None else None)
         )
         # Defense-in-depth behind the spec_hook startup allowlist: validate
         # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        if (
+            sampling_step is None
+            and use_rejection_sampling
+            and (draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1])
         ):
             raise ValueError(
                 "Rejection sampling requires a target-vocab draft proposal "
@@ -1057,23 +1077,29 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
+        if sampling_step is not None:
+            predict, accept_lens, accept_index = sampling_step(
+                target_probs, coins, coins_for_final_sampling
+            )
+            num_correct_drafts = accept_lens - 1
+        else:
+            sampling_fn(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
         del (
             expanded_temperature,
             target_probs,
