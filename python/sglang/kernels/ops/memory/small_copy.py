@@ -47,10 +47,8 @@ def _small_copy_kernel(
             tl.store(dst + dst_offset, values, offsets < sizes[i])
 
 
-def try_small_copy(dsts, srcs):
-    if len(dsts) < 2 or len(dsts) != len(srcs):
-        return False
-    supported = (
+_SUPPORTED_DTYPES = frozenset(
+    (
         torch.bool,
         torch.uint8,
         torch.int8,
@@ -62,59 +60,75 @@ def try_small_copy(dsts, srcs):
         torch.float32,
         torch.float64,
     )
+)
+_INDEX_DTYPES = frozenset((torch.int32, torch.int64))
+
+
+def _byte_range(tensor, n, row_stride, col_stride, cols):
+    # Bytes the 1-D or 2-D tensor spans; strides as passed to the kernel.
+    first = tensor.data_ptr()
+    if not n:
+        return first, first
+    rows = n // cols
+    extent = (rows - 1) * row_stride + (cols - 1) * col_stride + 1
+    return first, first + extent * tensor.element_size()
+
+
+def try_small_copy(dsts, srcs):
+    # Runs on every CUDA graph replay, so the checks stay on cheap tensor
+    # attributes and read each one once.
+    if len(dsts) < 2 or len(dsts) != len(srcs):
+        return False
     device = dsts[0].device
     if device.type != "cuda":
         return False
     sizes, cols, src_strides, dst_strides, bit_widths = [], [], [], [], []
     src_ranges, dst_ranges = [], []
     for dst, src in zip(dsts, srcs):
+        dst_dtype = dst.dtype
+        src_dtype = src.dtype
+        shape = dst.shape
+        ndim = len(shape)
         if (
-            dst.dtype not in supported
-            or src.dtype not in supported
+            dst_dtype not in _SUPPORTED_DTYPES
+            or src_dtype not in _SUPPORTED_DTYPES
             or dst.device != device
             or src.device != device
-            or dst.shape != src.shape
-            or dst.ndim not in (1, 2)
-            or dst.numel() > 8192
+            or src.shape != shape
+            or ndim not in (1, 2)
             or dst.requires_grad
             or src.requires_grad
             or src.is_neg()
             or dst.is_neg()
         ):
             return False
-        same_dtype = dst.dtype == src.dtype
+        n = dst.numel()
+        if n > 8192:
+            return False
+        same_dtype = dst_dtype == src_dtype
         if not same_dtype and not (
-            dst.dtype in (torch.int32, torch.int64)
-            and src.dtype in (torch.int32, torch.int64)
+            dst_dtype in _INDEX_DTYPES and src_dtype in _INDEX_DTYPES
         ):
             return False
-        n = dst.numel()
-        c = max(dst.shape[-1], 1)
-        ds = dst.stride() if dst.ndim == 2 else (0, dst.stride(0))
-        ss = src.stride() if src.ndim == 2 else (0, src.stride(0))
-        if ds[1] <= 0 or (dst.ndim == 2 and ds[0] < c * ds[1]):
+        c = max(shape[-1], 1)
+        ds = dst.stride() if ndim == 2 else (0, dst.stride(0))
+        ss = src.stride() if ndim == 2 else (0, src.stride(0))
+        if ds[1] <= 0 or (ndim == 2 and ds[0] < c * ds[1]):
             return False
         sizes.append(n)
         cols.append(c)
         src_strides.append(ss)
         dst_strides.append(ds)
         bit_widths.append(dst.element_size() * 8 if same_dtype else 0)
-        for tensor, ranges in ((src, src_ranges), (dst, dst_ranges)):
-            first = tensor.data_ptr()
-            extent = (
-                (sum((d - 1) * s for d, s in zip(tensor.shape, tensor.stride())) + 1)
-                * tensor.element_size()
-                if n
-                else 0
-            )
-            ranges.append((first, first + extent))
+        src_ranges.append(_byte_range(src, n, ss[0], ss[1], c))
+        dst_ranges.append(_byte_range(dst, n, ds[0], ds[1], c))
     for i, (first, last) in enumerate(dst_ranges):
         for j, (other_first, other_last) in enumerate(src_ranges):
             if first < other_last and other_first < last:
                 if (
                     i != j
                     or dsts[i].data_ptr() != srcs[i].data_ptr()
-                    or dsts[i].stride() != srcs[i].stride()
+                    or dst_strides[i] != src_strides[i]
                     or dsts[i].dtype != srcs[i].dtype
                 ):
                     return False
