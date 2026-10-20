@@ -1658,7 +1658,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
-            draft_token=draft_input.bonus_tokens,
+            draft_token=draft_input.bonus_tokens.to(torch.int64),
             custom_mask=custom_mask,
             positions=positions,
             retrieve_index=retrieve_index,
