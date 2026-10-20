@@ -2833,8 +2833,21 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         if not self.skip_prefill:
+            from sglang.srt.layers.attention.verify_mask import (
+                TreeMaskMode,
+                tree_mask_numel,
+            )
+
+            mask_numel = max_num_tokens * self.max_context_len
+            if self.num_draft_tokens:
+                mask_numel = tree_mask_numel(
+                    TreeMaskMode.FULL_MASK,
+                    max_bs,
+                    self.num_draft_tokens,
+                    self.max_context_len,
+                )
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (mask_numel,),
                 dtype=torch.uint8,
                 device=self.device,
             )
