@@ -1383,9 +1383,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 if forward_mode.is_target_verify() and spec_info is not None
                 else None
             )
-            prefill_wrappers = self._create_prefill_wrappers(
-                bs, use_custom_mask, variant
+            # Several output variants can capture the same attention shape.
+            # Reuse its wrappers so replay refreshes the plan buffers retained
+            # by every graph of that shape.
+            prefill_wrappers = (
+                self.target_verify_cuda_graph_wrappers.get((bs, num_tokens))
+                if forward_mode.is_target_verify()
+                else None
             )
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(
+                    bs, use_custom_mask, variant
+                )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             if forward_mode.is_target_verify():
                 self.target_verify_cuda_graph_wrappers[(bs, num_tokens)] = (
