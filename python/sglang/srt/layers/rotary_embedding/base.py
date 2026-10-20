@@ -520,7 +520,7 @@ class RotaryEmbedding(BaseFusedOp):
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    self.cos_sin_cache_as(query.dtype),
                     self.is_neox_style,
                 )
         return query, key
