@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """FlyDSL combine stage of the split-KV target verify (gfx950, bf16, head dim 256): drop-in for
 verify_splitkv._verify_combine_stage2_tree (draft tree, custom mask) and _verify_combine_stage2 (causal chain), so
 with the FlyDSL prefix stage (verify_prefix_flydsl.py) the verify attention is FlyDSL end to end.

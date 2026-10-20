@@ -132,6 +132,8 @@ FLY_TREE_MIN_SPLIT_KEYS = 256
 FLY_CHAIN_MIN_SPLIT_KEYS = 64
 
 
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 @functools.lru_cache(maxsize=None)
 def _flydsl_supported():
     if not (_IS_HIP and is_gfx95_supported()):

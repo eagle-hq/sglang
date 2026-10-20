@@ -699,6 +699,9 @@ def fused_conv_window_scatter_multi(
     )
 
 
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -706,13 +709,14 @@ def scatter_mamba_states_after_mtp_verify(
     mamba_track_indices: torch.Tensor | None,
     mamba_steps_to_track: torch.Tensor | None,
     src_indices_raw: torch.Tensor | None = None,
+    skip_ssm: bool = False,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
     persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
-    if ssm_states.numel() > 0:
+    if ssm_states.numel() > 0 and not skip_ssm:
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,

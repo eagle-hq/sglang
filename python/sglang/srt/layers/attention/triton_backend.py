@@ -147,6 +147,9 @@ class ForwardMetadata:
     uneven_batch: Optional[torch.Tensor] = None
 
 
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
 class TritonAttnBackend(AttentionBackend):
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.

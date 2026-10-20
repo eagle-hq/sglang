@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """FlyDSL prefix stage of the split-KV target verify (gfx950, bf16, head dim 256).
 
 Drop-in for verify_splitkv._verify_prefix_stage1_gqa: program (batch, kv head * row

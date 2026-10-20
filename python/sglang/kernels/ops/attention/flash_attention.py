@@ -9,7 +9,7 @@ from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_k
 
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
-# Written by Aditya Nandakumar (@proaditya) at AMD. From eagle-hq/EAGLE-4 41b4d2dd (PR #1).
+# Modified by Eagle AI Corp.
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -241,9 +241,6 @@ def flash_attn_with_kvcache(
         raise RuntimeError(f"Unknown flash attention version {ver}")
 
 
-# Copyright (c) 2026 Advanced Micro Devices, Inc.
-# SPDX-License-Identifier: Apache-2.0
-# Written by Aditya Nandakumar (@proaditya) at AMD. From eagle-hq/EAGLE-4 41b4d2dd (PR #1).
 def flash_attn_varlen_func(
     q,
     k,

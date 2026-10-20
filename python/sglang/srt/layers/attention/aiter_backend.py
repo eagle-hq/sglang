@@ -349,6 +349,9 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.

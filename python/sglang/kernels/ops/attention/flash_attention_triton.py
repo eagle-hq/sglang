@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0
-# Written by Aditya Nandakumar (@proaditya) at AMD. From eagle-hq/EAGLE-4 41b4d2dd, 15df42fb (PR #1).
 """Triton versions of flash_attn_with_kvcache / flash_attn_varlen_func for ROCm.
 
 FlashAttentionBackend (and the EAGLE-Harness fa3 draft path built on it) call these two

@@ -194,6 +194,9 @@ _is_xpu = is_xpu()
 # ratio-3 layout uses the Triton kernel's per-head walk (the CPU fused op still
 # requires a power-of-two group). Other backends keep the original tuple so
 # their control flow is unchanged.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
 _GDN_FUSED_QKVZBA_RATIOS = (
     (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )

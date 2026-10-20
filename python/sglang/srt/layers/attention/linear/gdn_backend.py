@@ -566,6 +566,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         num_v_heads=mamba_cache.temporal.shape[-3],
                         has_state_snapshots=mamba_cache.intermediate_ssm is not None,
                         device=torch.device(self.device),
+                        snapshot_shape=(
+                            tuple(mamba_cache.intermediate_ssm.shape)
+                            if mamba_cache.intermediate_ssm is not None else ()
+                        ),
+                        can_commit_state=(
+                            model_runner.server_args.disable_radix_cache
+                            and model_runner.server_args.pp_size == 1
+                        ),
                     )
                 )
             )

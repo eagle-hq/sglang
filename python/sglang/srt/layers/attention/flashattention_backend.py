@@ -59,7 +59,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import merge_state_v2
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
+if torch.version.hip is not None:
+    from sglang.srt.layers.attention.merge_state import merge_state as merge_state_v2
+else:
+    from sgl_kernel import merge_state_v2
 
 from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
@@ -278,7 +284,15 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
-        if self.fa_impl_ver == 3:
+        if self.fa_impl_ver == 3 and torch.version.hip is not None:
+            from sglang.kernels.ops.attention.flash_attention_triton import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
+            self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
+        elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
