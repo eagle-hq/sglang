@@ -126,6 +126,32 @@ class TestPrefillDelayerNonOverlapScheduler(CustomTestCase):
         self.assertEqual(delayer._gather_group, "nccl")
         _decisions(delayer)
 
+    def test_ranks_that_agree_negotiate_without_a_collective(self):
+        local = _decisions(self._delayer(disable_overlap_schedule=True))
+        self.gather.assert_not_called()
+
+        gathered = self._delayer(disable_overlap_schedule=True)
+        with patch.object(gathered, "_needs_gather", return_value=True):
+            self.assertEqual(_decisions(gathered), local)
+        self.assertEqual(self.gather.call_count, len(_PASSES))
+        self.assertIn((False, "delay", "all"), local)
+
+    def test_rank_local_inputs_keep_the_gather(self):
+        for name, delayer in [
+            ("dp_attention", self._delayer("dp_attention")),
+            (
+                "token watermark",
+                self._delayer(prefill_delayer_token_usage_low_watermark=0.5),
+            ),
+        ]:
+            with self.subTest(name):
+                self.assertTrue(delayer._needs_gather(None))
+
+        queue = self._delayer(prefill_delayer_queue_min_ratio=0.5)
+        self.assertFalse(queue._needs_gather(None))
+        # A delay in progress reads the wall-clock cap, which each rank reads.
+        self.assertTrue(queue._needs_gather(_State(delayed_count=1)))
+
 
 def _negotiate_with_skewed_clocks(rank, world_size, init_file):
     torch.distributed.init_process_group(
