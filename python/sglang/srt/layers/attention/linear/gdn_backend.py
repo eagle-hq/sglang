@@ -1269,10 +1269,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 if core_attn_out is None and verify_records is not None:
-                    raise RuntimeError(
-                        "this GDN target verify keeps replay records instead of "
-                        "per-draft state snapshots, but the speculative "
-                        "algorithm's verify extension did not run it"
+                    # A verify the extension leaves (no tree links: warmup and
+                    # autotune dummy runs) cannot commit through the records
+                    # (the commit refuses it), so only its outputs matter: the
+                    # recurrent kernel without per-step snapshots.
+                    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+                        fused_sigmoid_gating_delta_rule_update,
+                    )
+
+                    core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                        A_log=layer.A_log,
+                        dt_bias=layer.dt_bias,
+                        q=query,
+                        k=key,
+                        v=value,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=query_start_loc,
+                        use_qk_l2norm_in_kernel=True,
+                        softplus_beta=1.0,
+                        softplus_threshold=20.0,
+                        is_kda=False,
+                        disable_state_update=True,
+                        intermediate_states_buffer=None,
+                        retrieve_parent_token=retrieve_parent_token,
                     )
                 if core_attn_out is None:
                     core_attn_out = self.kernel_dispatcher.target_verify(

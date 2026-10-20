@@ -1722,6 +1722,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices,
                 parent[:request_number],
             )
+        if not committed_ssm and getattr(mamba_caches, "verify_records", None) is not None:
+            raise RuntimeError(
+                "this pool keeps GDN replay records instead of per-draft state "
+                "snapshots, but the verify extension did not commit this tree "
+                "verify from them"
+            )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,

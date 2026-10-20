@@ -183,9 +183,19 @@ class TestVerify(CustomTestCase):
         self.assertIs(out, extension.attn_out)
         backend.kernel_dispatcher.target_verify.assert_not_called()
 
-    def test_a_declining_extension_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "replay records"):
-            self._run(_Records(handle=False))
+    def test_a_verify_the_extension_leaves_runs_without_snapshots(self):
+        # warmup and autotune dummy runs carry no tree links; they never commit
+        sentinel = torch.zeros(1)
+        with mock.patch(
+            "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent."
+            "fused_sigmoid_gating_delta_rule_update",
+            return_value=sentinel,
+        ) as kernel:
+            backend, out, _ = self._run(_Records(handle=False))
+        self.assertIs(out, sentinel)
+        self.assertIsNone(kernel.call_args.kwargs["intermediate_states_buffer"])
+        self.assertTrue(kernel.call_args.kwargs["disable_state_update"])
+        backend.kernel_dispatcher.target_verify.assert_not_called()
 
     def test_tree_layout_accepts_records_but_not_the_ring(self):
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
@@ -213,6 +223,47 @@ class TestVerify(CustomTestCase):
         )
         with self.assertRaises(RuntimeError):
             backend._begin_verify_extension(forward_batch, in_graph=False)
+
+
+class TestCommit(CustomTestCase):
+    def test_records_without_a_commit_refuse_the_snapshot_scatter(self):
+        from sglang.srt.layers.attention import hybrid_linear_attn_backend as hybrid_mod
+
+        slots = torch.tensor([1], dtype=torch.int32)
+        cache = SimpleNamespace(temporal=torch.zeros(2, 2, HV, V, K), verify_records=torch.zeros(1))
+        for handled in (True, False):
+            extension = SimpleNamespace(commit_state=mock.Mock(return_value=handled))
+            linear = SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    mamba_cache_indices=slots,
+                    retrieve_parent_token=torch.zeros(1, WIDTH, dtype=torch.int32),
+                ),
+                req_to_token_pool=SimpleNamespace(
+                    get_speculative_mamba2_params_all_layers=lambda: cache,
+                    mamba_pool=SimpleNamespace(replayssm_is_kda=False),
+                ),
+                verify_extension=extension,
+                verify_intermediate_state_indices=torch.zeros(1, dtype=torch.int32),
+                accept_lens_pool=None,
+                _translate_mamba_indices=lambda value: value,
+            )
+            backend = hybrid_mod.HybridLinearAttnBackend.__new__(
+                hybrid_mod.HybridLinearAttnBackend
+            )
+            backend.linear_attn_backend = linear
+            backend._update_ple_state_after_mtp_verify = mock.Mock()
+            steps = torch.tensor([3], dtype=torch.int32)
+            with (
+                mock.patch.object(hybrid_mod, "pp_spec_stable_rows_enabled", return_value=False),
+                mock.patch.object(hybrid_mod, "scatter_mamba_states_after_mtp_verify") as scatter,
+            ):
+                if handled:
+                    backend.update_mamba_state_after_mtp_verify(steps, None, None, None)
+                    self.assertTrue(scatter.call_args.kwargs["skip_ssm"])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "replay records"):
+                        backend.update_mamba_state_after_mtp_verify(steps, None, None, None)
+                    scatter.assert_not_called()
 
 
 class _Plugin(CustomSpecAlgo):
