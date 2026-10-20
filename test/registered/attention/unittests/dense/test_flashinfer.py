@@ -317,6 +317,43 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    def test_prefix_prefill_does_not_compile_cascade_after_init(self):
+        from unittest.mock import patch
+
+        from flashinfer.cascade import get_cascade_module
+
+        from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+            DENSE_ATOL,
+            DENSE_RTOL,
+            build_dense_attention_fixture,
+            expected_dense_fixture_output,
+            run_dense_fixture_eager,
+        )
+
+        get_cascade_module.cache_clear()
+        case = DenseAttentionCase(
+            name="prefix_prefill_without_late_cascade_build",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=1,
+            prefix_lens=(8, 16),
+            extend_lens=(3, 2),
+        )
+        fixture = build_dense_attention_fixture(
+            self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+        )
+        with patch(
+            "flashinfer.cascade.gen_cascade_module",
+            side_effect=AssertionError(
+                "Cascade compilation after backend initialization"
+            ),
+        ):
+            actual = run_dense_fixture_eager(fixture)
+        expected = expected_dense_fixture_output(fixture)
+        torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+
     def test_layout_robustness_cases(self):
         for case in self.LAYOUT_ROBUSTNESS_CASES:
             # shuffled_pages is the default and already covered.
