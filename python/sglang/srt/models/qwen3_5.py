@@ -1,3 +1,5 @@
+# Modified by Eagle AI Corp.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
 # Copyright 2025 Qwen Team
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

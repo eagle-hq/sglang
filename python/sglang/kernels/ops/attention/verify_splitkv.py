@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """Split-KV (flash-decode) attention for EAGLE speculative *verify*.
 
 Two modes, chosen by the caller: a causal chain (speculative ``topk == 1``), and

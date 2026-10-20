@@ -1,3 +1,6 @@
+# Modified by Eagle AI Corp.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec

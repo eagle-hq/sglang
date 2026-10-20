@@ -1,3 +1,6 @@
+# Modified by Eagle AI Corp.
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
 import base64
 import functools
 import json
