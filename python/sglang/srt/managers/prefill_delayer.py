@@ -137,10 +137,6 @@ class PrefillDelayer:
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
 
-        assert not get_schedule().disable_overlap_schedule, (
-            "To use PrefillDelayer, disable_overlap_schedule must be False."
-        )
-
     def _negotiate_should_allow_prefill(
         self,
         local_prefillable: bool,
