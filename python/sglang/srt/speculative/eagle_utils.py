@@ -820,8 +820,8 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Apply penalties for the committed prefix. History-dependent penalties
+    # restrict acceptance to the root below.
     if sampling_info.acc_additive_penalties is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -1127,6 +1127,25 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    # Penalties describe the committed prefix, not each candidate's tree path.
+    # Only the root distribution is exact when a history-dependent penalty is
+    # active. Commit one draw, then let the next round update the history.
+    # Keep the unpenalized path unchanged, including its accepted draft count.
+    if (
+        sampling_info.acc_additive_penalties is not None
+        or sampling_info.acc_scaling_penalties is not None
+    ):
+        for row, req in enumerate(batch.reqs):
+            params = req.sampling_params
+            if (
+                params.frequency_penalty != 0.0
+                or params.presence_penalty != 0.0
+                or params.repetition_penalty != 1.0
+                or params.min_new_tokens > len(req.output_ids)
+            ):
+                num_correct_drafts[row : row + 1].zero_()
+                accept_index[row, 1:].fill_(-1)
+
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
@@ -1145,8 +1164,7 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Accumulate penalties from the committed tokens.
     if batch.sampling_info.penalizer_orchestrator.is_required:
         batch.cumulate_penalty_output_tokens()
 
