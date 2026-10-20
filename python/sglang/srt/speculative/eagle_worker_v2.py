@@ -1267,12 +1267,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         self._draft_worker = (
-            EagleDraftWorker(
-                server_args,
-                gpu_id,
-                nccl_port,
-                target_worker,
-            )
+            self.create_draft_worker(server_args, gpu_id, nccl_port, target_worker)
             if self._hosts_draft
             else None
         )
@@ -1295,6 +1290,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def create_draft_worker(
+        self,
+        server_args: ServerArgs,
+        gpu_id: int,
+        nccl_port: int,
+        target_worker: TpModelWorker,
+    ) -> EagleDraftWorker:
+        """Build the draft worker; only the last PP stage calls it.
+
+        A subclass overrides this to supply an ``EagleDraftWorker`` subclass
+        and keeps the rest of ``__init__``.
+        """
+        return EagleDraftWorker(server_args, gpu_id, nccl_port, target_worker)
 
     @property
     def last_shared_read_runner(self):

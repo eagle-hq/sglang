@@ -28,6 +28,8 @@ Start the server with `--speculative-algorithm MY_SPEC`.
 
 The worker class subclasses `BaseSpecWorker`. Its scheduler-facing methods (`forward_batch_generation`, `note_request_finished`, `on_verify_complete_cpu`, `activate_step_by_batch`) are the worker side of the contract.
 
+An algorithm that keeps EAGLE's draft model, draft KV pool and prefill can subclass `EAGLEWorkerV2` instead. Override `create_draft_worker(self, server_args, gpu_id, nccl_port, target_worker)` to return an `EagleDraftWorker` subclass; `EAGLEWorkerV2.__init__` calls it on the last pipeline stage only. On the draft worker, `init_attention_backend()` creates the draft attention backends and `_capture_cuda_graphs()` captures the draft graphs; both run inside the draft's TP and MoE contexts.
+
 ## Algorithm hooks
 
 Override these on the `CustomSpecAlgo` subclass passed as `spec_class`. Builtin algorithms implement the same methods, so the scheduler calls them without type checks.
@@ -50,13 +52,11 @@ import json
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.runtime_context import get_spec
 
-
 class MySpecAlgo(CustomSpecAlgo):
     def handle_server_args(self, server_args):
         raw = resolving_view(server_args).speculative_algorithm_config
         config = json.loads(raw) if raw else {}
         ...
-
 
 # In the worker, after startup:
 raw = get_spec().speculative_algorithm_config
