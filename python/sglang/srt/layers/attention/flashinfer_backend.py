@@ -79,6 +79,7 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
+        packbits,
     )
     from flashinfer.cascade import merge_state
 
@@ -211,6 +212,8 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
     uniform_verify_width: Optional[int] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    mask_indptr_host: Optional[torch.Tensor] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
@@ -259,8 +262,12 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
-
-    if custom_mask is not None:
+    if packed_custom_mask is not None:
+        self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+            packed_custom_mask, non_blocking=non_blocking
+        )
+        self._mask_indptr_buf.copy_(mask_indptr_host, non_blocking=non_blocking)
+    elif custom_mask is not None:
         # EAGLE's mask remains data-dependent: pack every actual tree-mask
         # bit, including rejected branches. Only its row lengths are known
         # on the host, so no device scalar read is needed for allocation.
@@ -870,25 +877,24 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_target_verify()
             and spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-            and getattr(spec_info, "custom_mask", None) is None
+            and seq_lens_cpu is not None
+            and spec_info.attn_kv_lens_cpu(seq_lens_cpu[:bs]) is not None
+            # A packed mask's size is host-known for one request only.
+            and (getattr(spec_info, "custom_mask", None) is None or bs == 1)
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
             and self.dispatch_reason is None
         ):
-            # DFLASH target-verify replays are shape-static per
-            # (bs, draft_token_num): qo_indptr is a constant arange stride of
-            # num_tokens_per_req, and the batch carries seq_lens_cpu =
-            # prefix + draft_token_num (dspark_draft._run_forward /
-            # dspark_verify.run_non_compact / dflash_worker_v2 all add the
-            # verify window host-side), which equals the device kv length
-            # generate_attn_arg_prefill produces. The host-kwargs assembly in
-            # call_begin_forward therefore applies verbatim; installing the
-            # sync-free plan removes three blocking .to("cpu") reads per
+            # Target-verify replays are shape-static per (bs, num_tokens):
+            # qo_indptr is a constant arange stride of num_tokens_per_req, and
+            # the spec input knows its KV lengths from the host seq_lens_cpu
+            # (SpecInput.attn_kv_lens_cpu). The sync-free plan removes the
+            # blocking .to("cpu") reads (and the mask packing's size read) per
             # replay that otherwise stall the CPU behind the in-flight graph.
-            # EAGLE uses the separate opt-in branch below because it must
-            # also pack its actual tree mask on every replay.
+            # This keys off the capture-time spec_info of these wrappers. The
+            # opt-in branch below also installs it for EAGLE batches of several
+            # requests with a mask, which fast_prefill_plan packs on the GPU.
             for w in self.target_verify_cuda_graph_wrappers[(bs, num_tokens)]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
@@ -2373,13 +2379,7 @@ class FlashInferIndicesUpdaterPrefill:
             assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
                 f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             )
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
-            eagle_verify = spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
-            assert use_custom_mask is None or eagle_verify
-            if eagle_verify:
-                # EAGLE carries the committed prefix length; its generated KV
-                # layout includes the complete candidate window after it.
-                seq_lens_cpu_i32 = seq_lens_cpu_i32 + num_tokens_per_req
+            kv_lens_cpu = spec_info.attn_kv_lens_cpu(seq_lens_cpu).to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2388,15 +2388,29 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_cpu, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
+                kv_lens_host=kv_lens_cpu,
                 max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
+                max_kv_len=int(kv_lens_cpu.max()),
             )
-            if eagle_verify:
+            if use_custom_mask is not None and bs == 1:
+                # One request: its [num_tokens_per_req, kv_len] mask packs to a
+                # host-known size.
+                mask_bits = num_tokens_per_req * int(kv_lens_cpu[0])
+                paged_plan_kwargs["packed_custom_mask"] = packbits(
+                    use_custom_mask[:mask_bits], "little"
+                )
+                paged_plan_kwargs["mask_indptr_host"] = torch.tensor(
+                    [0, (mask_bits + 7) // 8], dtype=torch.int32
+                )
+            elif use_custom_mask is not None:
+                # Several requests with a mask: only the opt-in EAGLE branch
+                # installs this plan for them, and every request verifies the
+                # same number of tokens.
+                assert spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
                 paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
         if window_left >= 0:
