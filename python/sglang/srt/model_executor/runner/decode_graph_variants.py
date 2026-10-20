@@ -64,6 +64,8 @@ class DecodeGraphVariant(NamedTuple):
 
     label: str
     num_tokens_per_req: int
+    # None retains the runner mode; DECODE permits a real no-spec fallback.
+    forward_mode: Optional[ForwardMode] = None
 
 
 class DecodeGraphVariants:
