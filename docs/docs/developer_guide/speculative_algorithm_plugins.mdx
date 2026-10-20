@@ -1,6 +1,6 @@
 ---
 title: "Add an out-of-tree speculative algorithm"
-description: "Register a speculative decoding algorithm from a plugin package and use the scheduler hooks it can override."
+description: "Register a speculative decoding algorithm from a plugin package and use the scheduler and verify hooks it can override."
 ---
 
 A speculative algorithm plugin adds a new `--speculative-algorithm` value without changing SGLang. The plugin registers the algorithm by name, returns its worker class, and overrides the hooks below. Every hook defaults to the builtin behavior, so builtin algorithms behave the same whether or not a plugin is installed.
@@ -40,6 +40,31 @@ Override these on the `CustomSpecAlgo` subclass passed as `spec_class`. Builtin 
 | `validate_request(self, req, *, has_mm_inputs: bool, enable_overlap: bool) -> Optional[str]` | Rejects multimodal requests when `supports_mm_inputs()` is `False`; otherwise `None` | Once per request on admission. A returned message aborts the request with it. `has_mm_inputs` reports images, audio or video, which `req` does not hold yet. Call `super().validate_request(...)` from an override to keep the multimodal check. |
 | `req_to_token_extra_len(self, page_size: int) -> int` | `0` | When the `req_to_token` pool is sized at startup. The row for each request gets at least this many slots past the context length, so an algorithm that writes draft or verify slots past `seq_len` cannot spill into the next request's row. It can only raise the default headroom. |
 | `uses_aux_hidden_states(self) -> bool` | `False` | When the target and draft model runners resolve their config. `True` makes the target capture the hidden states of the layers the draft's `eagle_config` names and feeds their concatenation to the draft, as for EAGLE-3, without the other `is_eagle3()` branches (token map, LM-head sharing, attention-DP topology). |
+
+## Verify hooks
+
+These let an algorithm change how the target model runs its verify forward. All default to the builtin behavior.
+
+On the `CustomSpecAlgo` subclass:
+
+| Hook | Default | Called |
+|---|---|---|
+| `create_decode_graph_variants(self, info: DecodeGraphRunnerInfo) -> Optional[DecodeGraphVariants]` | `None`: one graph per batch size at the static width | Once per decode / target-verify CUDA-graph runner, target and draft alike, before it captures. `info` says whether the runner is a draft runner, its capture mode, the widest verify its buffers fit and its device. A `DecodeGraphVariants` (`model_executor/runner/decode_graph_variants.py`) gives the graphs an extra axis, for example one target-verify graph per verify width: `capture_variants(bs)` lists the variants captured at each batch size, `replay_variant(forward_batch)` picks the graph of a step (asked once per step; `None` runs eagerly). |
+| `create_linear_attn_verify_extension(self, state: LinearAttnStateLayout) -> Optional[LinearAttnVerifyExtension]` | `None`: the backend's kernels | Once per GDN linear-attention backend. A `LinearAttnVerifyExtension` (`layers/attention/linear/verify_extension.py`) replaces the target-verify conv1d (`conv_update`) and gated delta recurrence (`recurrent_update`) for the verifies it gets a `LinearAttnVerifyLayout` for in `begin_forward(layout, in_graph=...)`, for example a verify over a tree-shaped draft. `reads_strided_inputs()` lets it take views of the input projection instead of split copies. |
+
+On the verify input (a `SpecInput` subclass, for example of `EagleVerifyInput`):
+
+| Hook | Default | Effect |
+|---|---|---|
+| `greedy_tokens_only: bool` | `False` | `True`: the forward needs only each verify row's greedy token. The logits processor then returns `LogitsProcessorOutput.next_token_ids` (the argmax, computed on the vocab-parallel LM-head output without gathering the logits) and `next_token_logits=None`. Where it cannot (DP attention, logit soft-capping) it returns the logits as usual, so read `next_token_ids` first and fall back to the logits. A CUDA graph captured with such an input replays it. |
+| `attn_kv_lens_cpu(self, seq_lens_cpu) -> Optional[torch.Tensor]` | `None`; EAGLE, NGRAM and DFLASH inputs implement it | Host copy of the KV lengths `generate_attn_arg_prefill` lays out. When it is known, the FlashInfer backend plans target-verify graph replays without copying the layout back from the GPU. |
+| `flashinfer_verify_variant(self, bs, num_tokens, *, q_dtype, kv_dtype, head_dim) -> Optional[FlashInferVerifyVariant]` | `None`: the builtin custom-mask attention | When the FlashInfer backend creates the target-verify wrappers of a captured graph. A `FlashInferVerifyVariant(jit_args, mask_buf)` builds them with FlashInfer's public `jit_args`, `custom_mask_buf=mask_buf` and `variant_owns_mask=True` (fa2 backend); the variant reads `mask_buf`, which its owner fills before each replay. |
+
+In a worker that verifies through `run_eagle_verify` (`speculative/eagle_worker_common.py`), for example an `EAGLEWorkerV2` subclass:
+
+| Hook | Default | Called |
+|---|---|---|
+| `run_eagle_verify(..., accept_step: Optional[VerifyAcceptStep])` | `None`: sglang's sampling and acceptance | Once per verified batch, on the forward stream, right after the target verify forward, as `accept_step(VerifyAcceptInput)`: the verify input, the forward's `next_token_ids` or `next_token_logits` and `hidden_states`, and the batch's `seq_lens`, `req_pool_indices` and `out_cache_loc`. It replaces the acceptance of that batch (the tree walk, the KV move of the accepted path and the move of its hidden-state rows) and returns a `VerifyAcceptResult(next_token_ids, accept_lens, accept_index, new_seq_lens, bonus_tokens, hidden_states)` in the default code's layout. sglang then commits the linear-attention states of the accepted path and builds the result. Pass it only for the batches the step handles: `run_eagle_verify` raises `ValueError` for a batch that needs grammar, logprobs, non-greedy sampling, penalties, a logit bias, a watermark or hierarchical sparse attention. |
 
 ## Algorithm configuration
 
