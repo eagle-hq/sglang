@@ -6,11 +6,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative import eagle_utils as utils
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def test_probability_sampler_sees_filtered_targets_and_returns_bonus_lengths():
-    from sglang.srt.layers import dp_attention
     from sglang.srt import runtime_context
+    from sglang.srt.layers import dp_attention
     from sglang.srt.speculative import spec_utils
 
     batch = SimpleNamespace(

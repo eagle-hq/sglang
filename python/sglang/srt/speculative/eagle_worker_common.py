@@ -820,7 +820,9 @@ def run_eagle_verify(
         )
 
     # Sample
-    if logits_output.next_token_logits is not None:  # None when the forward returned greedy ids
+    if (
+        logits_output.next_token_logits is not None
+    ):  # None when the forward returned greedy ids
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     (

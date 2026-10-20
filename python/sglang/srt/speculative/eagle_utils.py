@@ -809,8 +809,7 @@ def check_greedy_ids_batch(
             ("logit bias", sampling_info.logit_bias is not None),
             (
                 "a watermark",
-                watermark_state is not None
-                and sampling_info.has_watermark_candidates,
+                watermark_state is not None and sampling_info.has_watermark_candidates,
             ),
         )
         if used
@@ -957,14 +956,18 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if next_token_ids is not None or sampling_info.is_all_greedy or (
-        sampling_step is None
-        and _verify_uses_greedy(
-            is_all_greedy=sampling_info.is_all_greedy,
-            is_cpu=_is_cpu,
-            is_hip=_is_hip,
-            is_xpu=_is_xpu,
-            use_rejection_sampling=use_rejection_sampling,
+    if (
+        next_token_ids is not None
+        or sampling_info.is_all_greedy
+        or (
+            sampling_step is None
+            and _verify_uses_greedy(
+                is_all_greedy=sampling_info.is_all_greedy,
+                is_cpu=_is_cpu,
+                is_hip=_is_hip,
+                is_xpu=_is_xpu,
+                use_rejection_sampling=use_rejection_sampling,
+            )
         )
     ):
         if next_token_ids is None:

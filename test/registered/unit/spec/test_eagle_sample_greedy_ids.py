@@ -61,7 +61,11 @@ def _sample(logits_output, batch, **kwargs):
 
     def walk(**walk_kwargs):
         calls.append(walk_kwargs)
-        return walk_kwargs["predicts"], walk_kwargs["accept_index"], walk_kwargs["accept_token_num"]
+        return (
+            walk_kwargs["predicts"],
+            walk_kwargs["accept_index"],
+            walk_kwargs["accept_token_num"],
+        )
 
     with (
         mock.patch.object(eagle_utils, "verify_tree_greedy_func", side_effect=walk),
@@ -89,7 +93,9 @@ class TestEagleSampleGreedyIds(CustomTestCase):
         logits = torch.randn(BS * WIDTH, VOCAB)
         logits_output = SimpleNamespace(next_token_logits=logits, next_token_ids=None)
         calls = _sample(logits_output, _batch())
-        torch.testing.assert_close(calls[0]["target_predict"], logits.argmax(-1).view(BS, WIDTH))
+        torch.testing.assert_close(
+            calls[0]["target_predict"], logits.argmax(-1).view(BS, WIDTH)
+        )
 
     def test_ids_are_refused_where_the_logits_are_needed(self):
         ids = torch.zeros(BS * WIDTH, dtype=torch.int64)
