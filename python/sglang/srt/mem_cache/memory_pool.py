@@ -575,6 +575,11 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+        # A tree verify's replay records in place of the snapshots, under
+        # --enable-linear-replayssm-spec when the speculative algorithm keeps them
+        # (linear_verify_record_width): [num_layers, size + 1, draft_tokens, HV,
+        # width] fp32, written by its verify extension and committed by it.
+        verify_records: Optional[torch.Tensor] = None
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -659,6 +664,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_verify_record_width: int = 0,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -685,6 +691,9 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        # The configurator passes a positive width only for a tree verify under
+        # --enable-linear-replayssm-spec (with the flag itself off: no chain ring).
+        self.linear_verify_record_width = linear_verify_record_width
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -886,7 +895,8 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                # Replay records (a tree verify's own rollback) replace it as well.
+                if enable_linear_replayssm_spec or linear_verify_record_width:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -972,11 +982,27 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
+                verify_records = (
+                    torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            linear_verify_record_width,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if linear_verify_record_width
+                    else None
+                )
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    verify_records=verify_records,
                     replayssm_d=replayssm_d,
                     replayssm_k=replayssm_k,
                     replayssm_g=replayssm_g,
@@ -989,12 +1015,18 @@ class MambaPool:
                     if intermediate_ssm_state_cache is not None
                     else 0.0
                 )
+                verify_records_note = (
+                    f"verify_records size: {get_tensor_size_bytes(verify_records) / GB:.2f}GB "
+                    if verify_records is not None
+                    else ""
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
+                    f"{verify_records_note}"
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
@@ -1264,6 +1296,7 @@ class MambaPool:
         {
             "intermediate_ssm",
             "intermediate_conv_window",
+            "verify_records",
             "replayssm_d",
             "replayssm_k",
             "replayssm_g",
@@ -1394,6 +1427,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_verify_record_width: int = 0,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1433,6 +1467,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_verify_record_width=linear_verify_record_width,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1453,6 +1488,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        linear_verify_record_width: int = 0,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1471,6 +1507,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            linear_verify_record_width=linear_verify_record_width,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

@@ -574,6 +574,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             model_runner.server_args.disable_radix_cache
                             and model_runner.server_args.pp_size == 1
                         ),
+                        verify_records=mamba_cache.verify_records,
                     )
                 )
             )
@@ -643,13 +644,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and metadata.retrieve_parent_token is not None
         ):
             mamba_pool = self.req_to_token_pool.mamba_pool
-            if mamba_pool.mamba_cache.intermediate_ssm is None or (
+            cache = mamba_pool.mamba_cache
+            records = getattr(cache, "verify_records", None)
+            if (cache.intermediate_ssm is None and records is None) or (
                 getattr(mamba_pool, "replayssm_spec_fold", False)
                 or getattr(mamba_pool, "replayssm_cache_base", None) is not None
             ):
                 raise RuntimeError(
                     "A linear-attention verify extension needs the per-step "
-                    "state snapshot verify path; this target uses ReplaySSM."
+                    "state snapshot verify path or the pool's replay records; "
+                    "this target uses the ReplaySSM ring."
                 )
             layout = LinearAttnVerifyLayout(
                 next_token=metadata.retrieve_next_token,
@@ -1236,7 +1240,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # same flag that makes `use_replayssm_spec` true above), so
                 # this branch is unreachable with a None buffer by
                 # construction -- keep it loud rather than silently frozen.
-                assert intermediate_state_cache is not None, (
+                # A tree verify under the flag may keep the extension's replay
+                # records instead, which only the extension reads.
+                verify_records = mamba_cache_params.verify_records
+                assert (
+                    intermediate_state_cache is not None or verify_records is not None
+                ), (
                     "recurrent target_verify fallback requires intermediate_ssm, "
                     "which is not allocated under --enable-linear-replayssm-spec"
                 )
@@ -1252,8 +1261,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         ssm_states=ssm_states,
                         cache_indices=cache_indices,
                         query_start_loc=query_start_loc,
-                        intermediate_states=intermediate_state_cache,
+                        intermediate_states=(
+                            intermediate_state_cache
+                            if verify_records is None
+                            else verify_records
+                        ),
                         intermediate_state_indices=intermediate_state_indices,
+                    )
+                if core_attn_out is None and verify_records is not None:
+                    raise RuntimeError(
+                        "this GDN target verify keeps replay records instead of "
+                        "per-draft state snapshots, but the speculative "
+                        "algorithm's verify extension did not run it"
                     )
                 if core_attn_out is None:
                     core_attn_out = self.kernel_dispatcher.target_verify(

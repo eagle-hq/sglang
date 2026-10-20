@@ -442,12 +442,22 @@ def handle_linear_attn_backend(server_args: Any):
     # compensated hi/lo accumulation. The intra-window interaction
     # uses a strictly-lower causal mask, so it is valid ONLY for a linear
     # draft chain (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP);
-    # EAGLE tree verify (topk > 1) must fall back to the recurrent verify.
+    # EAGLE tree verify (topk > 1) must fall back to the recurrent verify,
+    # unless a plugin algorithm keeps a GDN tree verify's replay records in place
+    # of the snapshots (linear_attn_verify_record_width; the KV-cache
+    # configurator asks for the width once the model is known and refuses 0).
     # GDN sizes the window to the draft maximum; KDA (kda_backend) keeps a
     # --linear-replayssm-cache-len window and folds via its own fused
     # verify ring-write + commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
-        if cfg.speculative_eagle_topk not in (None, 1):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+        plugin_algo = isinstance(
+            SpeculativeAlgorithm.from_string(cfg.speculative_algorithm),
+            CustomSpecAlgo,
+        )
+        if cfg.speculative_eagle_topk not in (None, 1) and not plugin_algo:
             raise ValueError(
                 "--enable-linear-replayssm-spec requires a linear draft chain "
                 "(--speculative-eagle-topk in {None, 1}); the chunked verify "

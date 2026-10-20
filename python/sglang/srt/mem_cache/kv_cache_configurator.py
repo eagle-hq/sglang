@@ -1549,6 +1549,40 @@ class KVCacheConfigurator:
             extra_max_context_len=extra_max_context_len,
         )
 
+    def _linear_verify_record_width(self) -> int:
+        """fp32 values per (verify step, value head) of the replay records a GDN
+        tree verify keeps in place of per-step SSM snapshots, else 0.
+
+        Under --enable-linear-replayssm-spec a tree draft (top-k > 1) cannot use
+        the chain ring, so its speculative algorithm must keep replay records
+        (``linear_attn_verify_record_width``); anything else is refused here.
+        """
+        if not (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and (get_spec().speculative_eagle_topk or 1) > 1
+        ):
+            return 0
+        if self.hybrid_gdn_config is None:
+            raise ValueError(
+                "--enable-linear-replayssm-spec with a tree draft "
+                "(--speculative-eagle-topk > 1) needs a GDN target."
+            )
+        _, head_v_dim, head_k_dim = (
+            self.mambaish_config.mamba2_cache_params.shape.temporal
+        )
+        width = self.spec_algorithm.linear_attn_verify_record_width(
+            self.server_args, head_v_dim=head_v_dim, head_k_dim=head_k_dim
+        )
+        if width <= 0:
+            raise ValueError(
+                "--enable-linear-replayssm-spec with a tree draft "
+                "(--speculative-eagle-topk > 1) needs a speculative algorithm "
+                "whose GDN verify keeps replay records "
+                f"(linear_attn_verify_record_width); {self.spec_algorithm} keeps "
+                "per-step state snapshots. Drop --enable-linear-replayssm-spec."
+            )
+        return width
+
     def _get_mamba_layer_ids_for_req_pool(self) -> list:
         # Target layers on this rank only; a draft holding linear state gets its own
         # pool via clone_with_new_mamba.
@@ -1619,7 +1653,10 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+                # a tree verify keeps replay records instead of the chain ring
+                and not self._linear_verify_record_width()
             ),
+            linear_verify_record_width=self._linear_verify_record_width(),
         )
         return req_to_token_pool
 
@@ -1697,7 +1734,10 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+                # a tree verify keeps replay records instead of the chain ring
+                and not self._linear_verify_record_width()
             ),
+            linear_verify_record_width=self._linear_verify_record_width(),
         )
         return req_to_token_pool
 
@@ -3059,7 +3099,19 @@ class KVCacheConfigurator:
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
-        if replayssm_active:
+        verify_record_width = self._linear_verify_record_width()
+        if verify_record_width:
+            # A tree verify's replay records take the ring's place: fixed request
+            # scratch of [layers, draft tokens, HV, width] fp32 per request.
+            cache_params = config.mamba2_cache_params
+            replayssm_ring_per_req = (
+                len(cache_params.layers)
+                * max_speculative_num_draft_tokens()
+                * cache_params.shape.temporal[0]
+                * verify_record_width
+                * 4
+            )
+        elif replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(

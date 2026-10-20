@@ -47,6 +47,12 @@ class LinearAttnStateLayout:
     # Records-based commits are allowed only without radix tracking or PP overlap.
     snapshot_shape: tuple[int, ...] = ()
     can_commit_state: bool = False
+    # Replay records the pool allocated in place of the per-step snapshots
+    # (``linear_attn_verify_record_width`` of the speculative algorithm):
+    # [layers, rows, steps, value heads, width] fp32, else None. With them,
+    # ``recurrent_update`` gets this layer's slice as ``intermediate_states``
+    # and must run every tree verify; ``commit_state`` commits from them.
+    verify_records: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,7 +148,9 @@ class LinearAttnVerifyExtension:
         """Target-verify recurrence. Must write the per-token states into
         ``intermediate_states`` like the backend's kernel, so the post-verify
         commit works unchanged. Return the attention output, or None to run
-        the backend's ``target_verify`` kernel."""
+        the backend's ``target_verify`` kernel. With ``verify_records`` in the
+        layout, ``intermediate_states`` is this layer's records instead (no
+        snapshots exist) and returning None makes the backend raise."""
         return None
 
     def ssm_update(

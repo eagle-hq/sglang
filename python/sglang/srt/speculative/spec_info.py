@@ -281,6 +281,13 @@ class SpeculativeAlgorithm(Enum):
         backend; builtins run the backend's own verify kernels."""
         return None
 
+    def linear_attn_verify_record_width(
+        self, server_args: ServerArgs, *, head_v_dim: int, head_k_dim: int
+    ) -> int:
+        """Replay-record width of a GDN tree verify in place of per-step SSM
+        snapshots; builtins keep the snapshots (0)."""
+        return 0
+
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 

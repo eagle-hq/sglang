@@ -214,6 +214,20 @@ class CustomSpecAlgo:
         default) keeps the backend's kernels."""
         return None
 
+    def linear_attn_verify_record_width(
+        self, server_args: ServerArgs, *, head_v_dim: int, head_k_dim: int
+    ) -> int:
+        """fp32 values per (verify step, value head) of the replay records this
+        algorithm's GDN verify extension keeps in place of per-step SSM
+        snapshots, or 0 (the default) to keep the snapshots. Asked for a tree
+        draft (top-k > 1) under ``--enable-linear-replayssm-spec`` on a GDN
+        target: a positive width makes the pool allocate
+        ``LinearAttnStateLayout.verify_records`` instead of the snapshots (and
+        no chain ring), and the extension then runs every tree verify
+        recurrence on them and commits accepted states through
+        ``commit_state``."""
+        return 0
+
     def resolve_max_speculative_num_draft_tokens(
         self, server_args: ServerArgs
     ) -> Optional[int]:
