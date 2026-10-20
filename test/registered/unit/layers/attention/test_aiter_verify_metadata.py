@@ -127,5 +127,33 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
         )
 
 
+class TestAiterGraphMaskCapacity(CustomTestCase):
+    def test_mask_includes_verify_suffix(self):
+        for bs in (1, 3):
+            for width in (1, 8, 32):
+                with self.subTest(batch_size=bs, width=width):
+                    backend = _unified_verify_backend()
+                    backend.use_triton_unified_attention = False
+                    backend.skip_prefill = False
+                    backend.num_draft_tokens = width
+                    backend.init_cuda_graph_state(bs, bs * width)
+                    source = torch.ones(
+                        bs * width * (backend.max_context_len + width),
+                        dtype=torch.uint8,
+                    )
+                    backend.cuda_graph_custom_mask[: source.numel()].copy_(source)
+                    self.assertTrue(backend.cuda_graph_custom_mask.all())
+
+    def test_no_speculation_keeps_prefix_capacity(self):
+        backend = _unified_verify_backend()
+        backend.use_triton_unified_attention = False
+        backend.skip_prefill = False
+        backend.num_draft_tokens = None
+        backend.init_cuda_graph_state(2, 2)
+        self.assertEqual(
+            backend.cuda_graph_custom_mask.numel(), 2 * backend.max_context_len
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

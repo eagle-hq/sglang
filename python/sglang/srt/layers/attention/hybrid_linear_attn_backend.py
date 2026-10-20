@@ -1710,6 +1710,18 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        extension = getattr(self.linear_attn_backend, "verify_extension", None)
+        metadata = self.linear_attn_backend.forward_metadata
+        parent = getattr(metadata, "retrieve_parent_token", None)
+        committed_ssm = False
+        if extension is not None and parent is not None and mamba_track_indices is None:
+            committed_ssm = extension.commit_state(
+                mamba_caches.temporal,
+                state_indices_tensor,
+                self.linear_attn_backend.verify_intermediate_state_indices[:request_number],
+                last_correct_step_indices,
+                parent[:request_number],
+            )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1717,6 +1729,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
+            skip_ssm=committed_ssm,
         )
 
         self._update_ple_state_after_mtp_verify(

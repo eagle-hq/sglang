@@ -2,10 +2,14 @@ from typing import Optional, Union
 
 import torch
 
+from . import flash_attention_triton as _triton_fa
 from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
 
 
+# Copyright (c) 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Eagle AI Corp.
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -140,8 +144,20 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
-    if mask_mod is not None and ver != 4:
-        raise NotImplementedError("mask_mod requires FlashAttention 4")
+    if mask_mod is not None and (ver != 4 or torch.version.hip is not None):
+        raise NotImplementedError("mask_mod requires FlashAttention 4 on CUDA")
+    if torch.version.hip is not None:
+        # No FA3/FA4 build on ROCm: the Triton subset in flash_attention_triton.py.
+        return _triton_fa.flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k, v=v, qv=qv, rotary_cos=rotary_cos, rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens, cache_batch_idx=cache_batch_idx, cache_leftpad=cache_leftpad,
+            page_table=page_table, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q, q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            softmax_scale=softmax_scale, causal=causal, window_size=window_size,
+            attention_chunk=attention_chunk, softcap=softcap, return_softmax_lse=return_softmax_lse,
+            sinks=sinks, score_mod=score_mod, rel_bias=rel_bias, out=out, max_seqlen_k=max_seqlen_k,
+        )
+
     if ver == 3:
         return fa3_flash_attn_with_kvcache(
             q,
@@ -262,8 +278,17 @@ def flash_attn_varlen_func(
     out=None,
     mask_mod=None,
 ):
-    if mask_mod is not None and ver != 4:
-        raise NotImplementedError("mask_mod requires FlashAttention 4")
+    if mask_mod is not None and (ver != 4 or torch.version.hip is not None):
+        raise NotImplementedError("mask_mod requires FlashAttention 4 on CUDA")
+    if torch.version.hip is not None:
+        return _triton_fa.flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            seqused_q=seqused_q, seqused_k=seqused_k, page_table=page_table, softmax_scale=softmax_scale,
+            causal=causal, qv=qv, q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            window_size=window_size, attention_chunk=attention_chunk, softcap=softcap,
+            return_softmax_lse=return_softmax_lse, sinks=sinks, score_mod=score_mod, out=out,
+        )
+
     if ver == 3:
         return fa3_flash_attn_varlen_func(
             q,
