@@ -1235,6 +1235,17 @@ class NemotronHForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
+        else:
+            # Layer i's output is captured at the input of layer i + 1.
+            self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
+
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         if not self.pp_group.is_last_rank:
             return
