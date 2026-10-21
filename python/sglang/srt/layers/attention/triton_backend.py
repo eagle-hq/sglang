@@ -1101,6 +1101,14 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    window_kv_lens_sum=(
+                        None
+                        if forward_batch.extend_prefix_lens_cpu is None
+                        else sum(
+                            min(n, self.sliding_window_size)
+                            for n in forward_batch.extend_prefix_lens_cpu
+                        )
+                    ),
                 )
                 if self.enable_deterministic:
                     aligned_window_kv_indptr, aligned_window_kv_indices = (
@@ -2853,12 +2861,18 @@ def update_sliding_window_buffer(
     device=None,
     token_to_kv_pool=None,
     window_kv_indices=None,
+    window_kv_lens_sum=None,
 ):
     """Fill window KV buffers for sliding-window attention.
 
     Pass ``window_kv_indices`` to write into a pre-allocated buffer (CUDA-graph
     path); omit it (or pass ``None``) to allocate a fresh tensor (eager path,
-    requires ``device``).
+    requires ``device``). The eager path sizes that tensor from
+    ``window_kv_lens_sum``, the host-known sum of ``min(seq_lens, window)``,
+    when the caller has it; otherwise it reads the total back from the device,
+    which waits for all queued GPU work. A speculative draft plans its prefill
+    extend right after the target's prefill is queued, so that wait would
+    serialize the scheduler behind the whole target prefill.
 
     Unified pool: the gather reads the swa sub-pool's own id space (built
     directly from virtual ids through the swa side's own v2p), so the window
@@ -2874,7 +2888,13 @@ def update_sliding_window_buffer(
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:
         window_kv_indices = torch.empty(
-            window_kv_indptr[-1], dtype=torch.int64, device=device
+            (
+                window_kv_indptr[-1]
+                if window_kv_lens_sum is None
+                else window_kv_lens_sum
+            ),
+            dtype=torch.int64,
+            device=device,
         )
     window_kv_start_idx = seq_lens - window_kv_lens
     token_mapping = (
