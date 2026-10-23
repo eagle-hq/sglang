@@ -372,7 +372,9 @@ def build_unified_kv_indices(
     return unified_kv_indptr, unified_kv_indices, prefix_lens
 
 
-@triton.jit
+# compact_batch_size is a loop bound that changes with every batch: specializing
+# on its value (1, divisible by 16) compiled new variants while serving.
+@triton.jit(do_not_specialize=["compact_batch_size"])
 def _fwd_kernel(
     Q_Extend,
     K_Extend,

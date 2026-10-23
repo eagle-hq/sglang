@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.decode_attention import (
 )
 from sglang.kernels.ops.attention.extend_attention import (
     _compact_extend_q_tiles_per_head,
+    _fwd_kernel,
     align_window_kv_to_tiles,
     build_unified_kv_indices,
     extend_attention_fwd,
@@ -312,6 +313,50 @@ class TestTritonAttention(CustomTestCase):
         self.assertTrue(
             torch.allclose(o_extend_mask, o_redundant, rtol=1e-2, atol=1e-3)
         )
+
+    def test_extend_attention_batch_sizes_reuse_one_kernel(self):
+        # A server extends a new batch size every few steps; none of them may
+        # compile another kernel while it serves.
+        device = get_device()
+        kernel_cache = _fwd_kernel.device_caches[torch.device(device).index or 0][0]
+        H_Q, H_KV, D, dtype = 8, 2, 128, torch.bfloat16
+        count = None
+        for B in (1, 15, 16, 17, 32, 48, 64):
+            prefix = torch.randint(1, 20, (B,), dtype=torch.int32, device=device)
+            extend = torch.randint(1, 20, (B,), dtype=torch.int32, device=device)
+            kv_indptr = torch.zeros(B + 1, dtype=torch.int32, device=device)
+            kv_indptr[1:] = torch.cumsum(prefix, 0)
+            qo_indptr = torch.zeros(B + 1, dtype=torch.int32, device=device)
+            qo_indptr[1:] = torch.cumsum(extend, 0)
+            num_prefix, num_extend = int(kv_indptr[-1]), int(qo_indptr[-1])
+            kv_indices = torch.arange(num_prefix, dtype=torch.int32, device=device)
+            k_buffer = torch.randn(num_prefix, H_KV, D, dtype=dtype, device=device)
+            v_buffer = torch.randn_like(k_buffer)
+            q = torch.randn(num_extend, H_Q, D, dtype=dtype, device=device)
+            k = torch.randn(num_extend, H_KV, D, dtype=dtype, device=device)
+            v = torch.randn_like(k)
+            o = torch.empty_like(q)
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                o,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                int(extend.max()),
+                1.0,
+                1.0,
+            )
+            self.assertTrue(bool(torch.isfinite(o.float()).all()), B)
+            if count is None:
+                count = len(kernel_cache)
+            self.assertEqual(len(kernel_cache), count, B)
 
     def test_extend_attention(self):
 
