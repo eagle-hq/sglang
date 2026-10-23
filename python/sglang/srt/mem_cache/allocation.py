@@ -31,7 +31,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    next_power_of_2,
     support_triton,
 )
 from sglang.srt.utils.common import is_pin_memory_available
@@ -688,7 +687,16 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
     return out_cache_loc
 
 
-@triton.jit
+# The allocator hands out slices at any offset, and the batch size changes every
+# step: specializing on either would compile new variants while serving.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "req_pool_indices",
+        "start_offset",
+        "end_offset",
+        "out_cache_loc",
+    ]
+)
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token,
@@ -696,7 +704,6 @@ def assign_req_to_token_pool(
     end_offset,
     out_cache_loc,
     pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 32
     pid = tl.program_id(axis=0)
@@ -704,10 +711,14 @@ def assign_req_to_token_pool(
     kv_end = tl.load(end_offset + pid)
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
-    out_offset = tl.sum(end - start, axis=0)
+    # This request's tokens start after those of the requests before it.
+    out_offset = tl.full((), 0, tl.int64)
+    for i in range(0, pid, BLOCK_SIZE):
+        prev = i + tl.arange(0, BLOCK_SIZE)
+        mask = prev < pid
+        start = tl.load(start_offset + prev, mask=mask, other=0)
+        end = tl.load(end_offset + prev, mask=mask, other=0)
+        out_offset += tl.sum(end - start, axis=0).to(tl.int64)
 
     out_cache_ptr = out_cache_loc + out_offset
 
@@ -759,7 +770,6 @@ def assign_req_to_token_pool_func(
         end_offset,
         out_cache_loc,
         req_to_token.shape[1],
-        next_power_of_2(batch_size),
     )
 
 
