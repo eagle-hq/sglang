@@ -1533,12 +1533,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions_decode(
         self, model_runner: ModelRunner, batch: ScheduleBatch
     ):
-        seq_lens_cpu = self.seq_lens_cpu
-        batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
+        batch_size = len(mm_inputs)
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         seq_lens_int64 = self.seq_lens.to(torch.int64)
+        has_multimodal_input = any(mm is not None for mm in mm_inputs)
 
+        if rl_on_policy_target is not None or not has_multimodal_input:
+            # Text-only: device lengths suffice (a speculative batch decoding
+            # natively under overlap has no host lengths).
+            positions_1d = seq_lens_int64 - 1
+            self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
+            return
+
+        seq_lens_cpu = (
+            self.seq_lens_cpu if self.seq_lens_cpu is not None else self.seq_lens.cpu()
+        )
         # Some multimodal models (e.g. image generation models) provide
         # precomputed MRoPE positions. In this case, positions cannot be
         # reconstructed only from mrope_position_delta and need the original
@@ -1549,13 +1559,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and mm.mrope_positions.shape[1] >= seq_lens_cpu[i]
             for i, mm in enumerate(mm_inputs)
         )
-        has_multimodal_input = any(mm is not None for mm in mm_inputs)
-
-        if rl_on_policy_target is not None or not has_multimodal_input:
-            # Text-only
-            positions_1d = seq_lens_int64 - 1
-            self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
-            return
 
         if not has_precomputed_mrope:
             # Compute all requests together to avoid per-request Python loops.
