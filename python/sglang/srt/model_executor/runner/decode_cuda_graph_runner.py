@@ -410,10 +410,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens_per_req=self.captured_req_width,
             )
 
-        enable_mamba_track = (
-            get_exec().mamba.enable_mamba_extra_buffer
-            and self.model_runner.spec_algorithm.is_none()
+        # Captures the per-replay attention-metadata prep into a small CUDA
+        # graph; see metadata_glue_graph.py for the correctness contract.
+        # Force-off for DFlash-family spec: verify installs host-fed fast
+        # plans (sync-free begin_forward that recomputes plan inputs on the
+        # host every replay), and capturing one freezes the capture-time
+        # plan — drafts go stale and accept length collapses to ~1.
+        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+            logger.warning(
+                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
+                "DFlash-family speculative decoding (host-fed fast verify "
+                "plans must re-run on the host every replay); disabling the "
+                "metadata glue graph."
+            )
+            enable_metadata_glue = False
+        self._metadata_glue = (
+            MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+
+        # --- speculative graph variants --------------------------------
+        self._init_graph_variants()
+
+        enable_mamba_track = self._tracks_mamba()
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -490,30 +509,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
 
-        # Captures the per-replay attention-metadata prep into a small CUDA
-        # graph; see metadata_glue_graph.py for the correctness contract.
-        # Force-off for DFlash-family spec: verify installs host-fed fast
-        # plans (sync-free begin_forward that recomputes plan inputs on the
-        # host every replay), and capturing one freezes the capture-time
-        # plan — drafts go stale and accept length collapses to ~1.
-        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
-            logger.warning(
-                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
-                "plans must re-run on the host every replay); disabling the "
-                "metadata glue graph."
-            )
-            enable_metadata_glue = False
-        self._metadata_glue = (
-            MetadataGlueGraph(self.device) if enable_metadata_glue else None
-        )
-
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
-
-        # --- speculative graph variants --------------------------------
-        self._init_graph_variants()
 
         # --- capture --------------------------------------------------
         try:
@@ -648,6 +645,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_attn_tp_gather(),
         )
 
+    def _tracks_mamba(self) -> bool:
+        """Whether the graphs save Mamba prefix-cache states: a no-spec decode
+        does, and so does a speculative runner's DECODE-mode graph variant,
+        which decodes natively (decode_graph_variants.py)."""
+        return get_exec().mamba.enable_mamba_extra_buffer and (
+            self.model_runner.spec_algorithm.is_none()
+            or self.graph_variants is not None
+        )
+
     def _init_graph_variants(self) -> None:
         """Ask the speculative algorithm for extra graph variants (see
         decode_graph_variants.py). None keeps one graph per batch size."""
@@ -658,6 +664,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_forward_mode=self.capture_forward_mode,
                     max_tokens_per_req=self.captured_req_width,
                     device=self.model_runner.device,
+                    mamba_track=get_exec().mamba.enable_mamba_extra_buffer,
                 )
             )
         )

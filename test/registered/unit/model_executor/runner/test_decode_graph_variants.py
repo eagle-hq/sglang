@@ -154,6 +154,25 @@ class TestDefaultIsNoVariants(CustomTestCase):
         self.assertIsNone(plain.graph_variants)
         self.assertIs(plain._metadata_glue, glue)
 
+    def test_native_decode_variants_track_mamba_like_a_no_spec_decode(self):
+        def tracks(spec_algorithm, provider, extra_buffer):
+            runner = _bare_runner(provider)
+            runner.model_runner.spec_algorithm = spec_algorithm
+            mamba = SimpleNamespace(enable_mamba_extra_buffer=extra_buffer)
+            with mock.patch.object(
+                mod, "get_exec", return_value=SimpleNamespace(mamba=mamba)
+            ):
+                return runner._tracks_mamba()
+
+        spec = SpeculativeAlgorithm.EAGLE
+        # No-spec decode tracks; a spec runner tracks only where its variants
+        # can decode natively; nothing tracks without prefix-cache tracking.
+        self.assertTrue(tracks(SpeculativeAlgorithm.NONE, None, True))
+        self.assertFalse(tracks(spec, None, True))
+        self.assertTrue(tracks(spec, _Widths(), True))
+        self.assertFalse(tracks(spec, _Widths(), False))
+        self.assertFalse(tracks(SpeculativeAlgorithm.NONE, None, False))
+
     def test_capture_without_provider_is_one_default_graph_per_bs(self):
         runner = _bare_runner()
         self.assertEqual(runner._capture_graph_variants(2), [None])

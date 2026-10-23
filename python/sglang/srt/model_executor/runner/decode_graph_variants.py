@@ -56,6 +56,10 @@ class DecodeGraphRunnerInfo(NamedTuple):
     # The widest verify a variant may use (the runner's static buffers).
     max_tokens_per_req: int
     device: torch.device
+    # Mamba prefix-cache tracking is on: a DECODE-mode variant then replays the
+    # batch's mamba_track_indices / mamba_track_mask like a no-spec decode, so
+    # its caller sets them as ScheduleBatch.prepare_for_decode does.
+    mamba_track: bool = False
 
 
 class DecodeGraphVariant(NamedTuple):
