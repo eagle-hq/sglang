@@ -164,6 +164,14 @@ _KV_POOL_BASE_FOR_KIND: dict[str, type] = {
 }
 
 
+def _speculative_verify_rows(spec_algorithm) -> Optional[int]:
+    """The speculative algorithm's verify batch limit, or None when it
+    verifies every running batch (``max_verify_batch_size``)."""
+    if spec_algorithm.is_none():
+        return None
+    return spec_algorithm.max_verify_batch_size()
+
+
 def _pd_prefill_skips_mamba_spec_state() -> bool:
     # Prefill never runs TARGET_VERIFY, so the plain hybrid req pool skips the
     # verify-only snapshots; role-switch and unified-memory pools still allocate them.
@@ -1667,7 +1675,10 @@ class KVCacheConfigurator:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
-            mamba_spec_state_size=max_num_reqs,
+            mamba_spec_state_size=min(
+                max_num_reqs,
+                _speculative_verify_rows(self.spec_algorithm) or max_num_reqs,
+            ),
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -3089,6 +3100,9 @@ class KVCacheConfigurator:
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
+        # An algorithm that verifies at most verify_rows requests has verify
+        # states for that many rows, whatever the number of running requests.
+        verify_rows = _speculative_verify_rows(self.spec_algorithm)
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -3105,6 +3119,7 @@ class KVCacheConfigurator:
                 capped_reqs = min(
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
+                    verify_rows or get_schedule().max_running_requests,
                 )
                 intermediate_size = (
                     stage_per_req
@@ -3126,10 +3141,12 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm and on PD prefill.
             if reserves_spec_state:
+                rows = min(
+                    get_schedule().max_mamba_cache_size,
+                    verify_rows or get_schedule().max_mamba_cache_size,
+                )
                 intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    stage_per_req * (rows + 1) * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -3146,7 +3163,7 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if reserves_spec_state:
+            if reserves_spec_state and verify_rows is None:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
@@ -3174,6 +3191,21 @@ class KVCacheConfigurator:
                         // per_slot
                     ),
                 )
+                if reserves_spec_state:
+                    # Verify states for a fixed number of rows hold per-token
+                    # states of the drafted tokens: they come out of the token
+                    # budget, so the state slots, and with them the number of
+                    # running requests, match a server without speculation.
+                    rows = min(
+                        verify_rows,
+                        max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                    )
+                    intermediate_size = (
+                        per_req * (rows + 1) * get_spec().speculative_num_draft_tokens
+                    )
+                    total_rest_memory = total_rest_memory - (
+                        intermediate_size / (1 << 30)
+                    )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested

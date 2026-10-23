@@ -551,6 +551,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             build_verify_intermediate_state_indices(
                 self.req_to_token_pool.size,
                 model_runner.device,
+                getattr(self.req_to_token_pool, "mamba_spec_state_size", None),
             )
         )
         self._use_strided_target_verify_qkv = False

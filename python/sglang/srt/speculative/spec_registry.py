@@ -203,6 +203,15 @@ class CustomSpecAlgo:
         per batch size at the static width."""
         return None
 
+    def max_verify_batch_size(self) -> Optional[int]:
+        """The largest batch this algorithm verifies, or ``None`` (the default)
+        for every running batch. An algorithm that returns a limit decodes
+        larger batches without speculation (a DECODE-mode graph variant), and
+        a hybrid target sizes its per-step verify states (``intermediate_ssm``
+        and the conv windows) for that many rows instead of for every running
+        request, so they no longer limit how many requests run."""
+        return None
+
     def create_linear_attn_verify_extension(
         self, state: LinearAttnStateLayout
     ) -> Optional[LinearAttnVerifyExtension]:

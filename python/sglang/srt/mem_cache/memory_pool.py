@@ -1458,6 +1458,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
     ):
+        # Rows of the speculative verify scratch (build_verify_intermediate_state_indices).
+        self.mamba_spec_state_size = mamba_spec_state_size
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,

@@ -125,10 +125,17 @@ def select_verify_intermediate_state_indices(
     )
 
 
-def build_verify_intermediate_state_indices(pool_size: int, device):
+def build_verify_intermediate_state_indices(
+    pool_size: int, device, scratch_rows: Optional[int] = None
+):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
     target_verify path: request slot i owns scratch row i.
+
+    ``scratch_rows`` (default ``pool_size``): rows of the scratch when the
+    algorithm verifies fewer rows than the pool holds requests
+    (``max_verify_batch_size``); rows past it only appear in captured graphs
+    the algorithm never replays, so they share the padding row too.
 
     The scratch is allocated with one extra padding row (the `+1` in
     MambaPool.SpeculativeState, index `pool_size`). Warmup and MLP-sync
@@ -143,15 +150,16 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
 
     from sglang.srt.utils.common import get_eager_max_batch_size
 
+    rows = pool_size if scratch_rows is None else min(scratch_rows, pool_size)
     padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
-    indices = torch.arange(pool_size, dtype=torch.int32, device=device)
-    if padded_bs > pool_size:
+    indices = torch.arange(rows, dtype=torch.int32, device=device)
+    if padded_bs > rows:
         indices = torch.cat(
             [
                 indices,
                 torch.full(
-                    (padded_bs - pool_size,),
-                    pool_size,
+                    (padded_bs - rows,),
+                    rows,
                     dtype=torch.int32,
                     device=device,
                 ),

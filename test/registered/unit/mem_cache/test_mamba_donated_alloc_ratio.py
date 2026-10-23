@@ -413,7 +413,15 @@ class TestPPMambaPoolSizing(unittest.TestCase):
 
 class TestExtraMambaCacheSizing(unittest.TestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes,
+        *,
+        pp_size=1,
+        dp_size=1,
+        draft_tokens=None,
+        verify_rows=None,
+        **schedule,
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -426,7 +434,10 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
             fused_entry_bytes=lambda name: None,
-            spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
+            spec_algorithm=SimpleNamespace(
+                is_none=lambda: draft_tokens is None,
+                max_verify_batch_size=lambda: verify_rows,
+            ),
             attn_dp_size=dp_size,
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
@@ -469,6 +480,23 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_a_verify_batch_limit_keeps_admission_and_charges_the_token_budget(self):
+        # Slots as without speculation (9); the (2 + 1) rows x 2 draft tokens x
+        # 4 MiB of verify states come out of what is left for the KV cache.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, verify_rows=2), (9, (80 - 24) << 20)
+        )
+        # The limit also caps the rows of the fixed-capacity branches.
+        self.assertEqual(
+            self._size(0, draft_tokens=2, verify_rows=2, max_mamba_cache_size=8),
+            (8, (84 - 24) << 20),
+        )
+        fixed = dict(disable_radix_cache=True, max_running_requests=8)
+        self.assertEqual(
+            self._size(0, draft_tokens=2, verify_rows=2, **fixed),
+            (8, (84 - 24) << 20),
+        )
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token

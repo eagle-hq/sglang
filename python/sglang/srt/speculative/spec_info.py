@@ -274,6 +274,11 @@ class SpeculativeAlgorithm(Enum):
         builtins capture one graph per batch size at the static width."""
         return None
 
+    def max_verify_batch_size(self) -> Optional[int]:
+        """The largest batch this algorithm verifies; builtins verify every
+        running batch."""
+        return None
+
     def create_linear_attn_verify_extension(
         self, state: LinearAttnStateLayout
     ) -> Optional[LinearAttnVerifyExtension]:

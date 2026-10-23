@@ -461,5 +461,26 @@ class TestVariableVerifyWidth(CustomTestCase):
         )
 
 
+
+class TestVerifyScratchRows(CustomTestCase):
+    def test_rows_past_the_verify_limit_share_the_padding_row(self):
+        from sglang.srt.layers.attention.linear import utils
+
+        with mock.patch(
+            "sglang.srt.utils.common.get_eager_max_batch_size", lambda bs: bs
+        ):
+            every = utils.build_verify_intermediate_state_indices(6, "cpu")
+            limited = utils.build_verify_intermediate_state_indices(6, "cpu", 2)
+        self.assertEqual(every.tolist(), [0, 1, 2, 3, 4, 5])
+        # Two scratch rows and their padding row (2): the table still covers
+        # every pool slot, so a captured graph of any batch size indexes it.
+        self.assertEqual(limited.tolist(), [0, 1, 2, 2, 2, 2])
+
+    def test_builtins_verify_every_running_batch(self):
+        self.assertIsNone(SpeculativeAlgorithm.EAGLE.max_verify_batch_size())
+        plugin = CustomSpecAlgo(name="PLUGIN", factory=lambda server_args: None)
+        self.assertIsNone(plugin.max_verify_batch_size())
+
+
 if __name__ == "__main__":
     unittest.main()
