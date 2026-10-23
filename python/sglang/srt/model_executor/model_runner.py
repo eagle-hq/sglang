@@ -358,6 +358,8 @@ class ModelRunner:
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
+        # Set on target by `account_draft_worker_memory`.
+        self.draft_worker_memory_gb = 0.0
         self.gpu_id = gpu_id
         self.model_config = model_config
         self.dist_port = nccl_port
@@ -679,6 +681,7 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=self.draft_model_idx,
+            draft_worker_memory_gb=self.draft_worker_memory_gb,
         )
 
     def init_mindspore_runner(self):
@@ -932,6 +935,11 @@ class ModelRunner:
         if preloaded_weights_bytes == 0:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
+
+    def account_draft_worker_memory(self, draft_worker_memory_gb: float) -> None:
+        # The draft worker was built before this target sizes its pools; its
+        # memory is charged to the token budget, not the hybrid state slots.
+        self.draft_worker_memory_gb = max(0.0, draft_worker_memory_gb)
 
     def init_kv_index_translator(self):
         """The one object that converts KV ids for this runner: attention

@@ -172,6 +172,20 @@ def _speculative_verify_rows(spec_algorithm) -> Optional[int]:
     return spec_algorithm.max_verify_batch_size()
 
 
+def startup_free_gpu_memory_gb(device, gpu_id) -> float:
+    """Free GPU memory in GB as the KV pool budget sees it: the minimum over
+    ranks, after dropping unreferenced weight-loading temporaries (which
+    empty_cache() inside get_available_gpu_memory cannot reclaim while
+    referenced)."""
+    gc.collect()
+    return get_available_gpu_memory(
+        device,
+        gpu_id,
+        distributed=get_parallel().launch_world_size > 1,
+        cpu_group=get_parallel().world_group.cpu_group,
+    )
+
+
 def _pd_prefill_skips_mamba_spec_state() -> bool:
     # Prefill never runs TARGET_VERIFY, so the plain hybrid req pool skips the
     # verify-only snapshots; role-switch and unified-memory pools still allocate them.
@@ -349,6 +363,9 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    # GPU memory the speculative draft worker took before the pools were sized
+    # (its weights and buffers); see _handle_max_mamba_cache.
+    draft_worker_memory_gb: float = 0.0
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -2792,18 +2809,10 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
-        # Weight-loading temporaries can still be referenced at this point, and
-        # empty_cache() (which get_available_gpu_memory already calls) cannot
-        # reclaim referenced blocks. Without collecting first, the KV budget is
+        # Without collecting weight-loading temporaries first, the KV budget is
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
-        gc.collect()
-        available_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_parallel().launch_world_size > 1,
-            cpu_group=get_parallel().world_group.cpu_group,
-        )
+        available_gpu_memory = startup_free_gpu_memory_gb(self.device, self.gpu_id)
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
         # Every prefill batch fits a captured bucket when batches are capped at the
@@ -3155,9 +3164,12 @@ class KVCacheConfigurator:
             per_req = stage_per_req
 
             # Solve jointly for max_mamba_cache_size (K), including the pool's
-            # +1 padding slot on both buffers (see memory_pool.py).
+            # +1 padding slot on both buffers (see memory_pool.py). The draft
+            # worker's memory is a fixed cost of speculation, like its KV and the
+            # verify states: the token budget pays it, so the state slots, and
+            # with them the running requests, match a server without speculation.
             mamba_budget = (
-                total_rest_memory
+                (total_rest_memory + self.draft_worker_memory_gb)
                 * get_schedule().mamba_full_memory_ratio
                 / (1 + get_schedule().mamba_full_memory_ratio)
             )

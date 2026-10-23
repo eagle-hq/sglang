@@ -352,6 +352,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
+            draft_worker_memory_gb=0.0,
             fused_entry_bytes=lambda name: (
                 fused_state_entry if name == "mamba" else None
             ),
@@ -420,6 +421,8 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         dp_size=1,
         draft_tokens=None,
         verify_rows=None,
+        rest_mib=120,
+        draft_mib=0,
         **schedule,
     ):
         from sglang.srt import runtime_context as rc
@@ -433,6 +436,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            draft_worker_memory_gb=draft_mib / 1024,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(
                 is_none=lambda: draft_tokens is None,
@@ -453,7 +457,9 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         )
         args.update(schedule)
         with rc.get_context().override_server_args(**args):
-            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+            remaining = KVCacheConfigurator._handle_max_mamba_cache(
+                fake, rest_mib / 1024
+            )
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
     def test_auto_capacity_reserves_backend_state(self):
@@ -480,6 +486,19 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_draft_worker_memory_comes_out_of_the_token_budget(self):
+        # A draft that took 24 of the 120 MiB leaves 96 MiB of rest memory: the
+        # state slots stay those of the 120 MiB server (9 without a verify
+        # limit's scratch, 3 in the joint solve) and the KV cache pays 24 MiB.
+        draft = dict(rest_mib=96, draft_mib=24, draft_tokens=2)
+        self.assertEqual(self._size(0, verify_rows=2, **draft), (9, (56 - 24) << 20))
+        self.assertEqual(self._size(0, **draft), (3, (88 - 24) << 20))
+        # Fixed capacities are unchanged; the draft is already out of the rest.
+        self.assertEqual(
+            self._size(0, verify_rows=2, max_mamba_cache_size=8, **draft),
+            (8, (84 - 24 - 24) << 20),
+        )
 
     def test_a_verify_batch_limit_keeps_admission_and_charges_the_token_budget(self):
         # Slots as without speculation (9); the (2 + 1) rows x 2 draft tokens x

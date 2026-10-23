@@ -1111,7 +1111,20 @@ class Scheduler(
         self.init_tp_model_worker()
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
-        self.maybe_init_draft_worker()
+        if self.spec_algorithm.is_none():
+            self.maybe_init_draft_worker()
+        else:
+            # Measured on every rank (a collective), also where PP builds no draft.
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                startup_free_gpu_memory_gb,
+            )
+
+            runner = self.tp_worker.model_runner
+            free_gb = startup_free_gpu_memory_gb(runner.device, runner.gpu_id)
+            self.maybe_init_draft_worker()
+            runner.account_draft_worker_memory(
+                free_gb - startup_free_gpu_memory_gb(runner.device, runner.gpu_id)
+            )
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
