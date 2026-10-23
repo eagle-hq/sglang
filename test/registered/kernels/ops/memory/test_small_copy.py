@@ -141,6 +141,30 @@ class TestSmallCopy(CustomTestCase):
             elif n > 48:
                 self.assertEqual(len(kernel_cache), specialization_count)
 
+    def test_sizes_and_alignments_reuse_one_kernel(self):
+        # Replays copy batch-sized slices from wherever the allocator put
+        # them; a new size or address must not compile another kernel.
+        kernel_cache = _small_copy_kernel.device_caches[torch.cuda.current_device()][0]
+        values = torch.randint(-(2**40), 2**40, (256,), device="cuda")
+        indices = torch.randint(-(2**30), 2**30, (256,), device="cuda").int()
+        flags = torch.randint(0, 256, (256,), device="cuda", dtype=torch.uint8)
+        backings = [
+            torch.empty(256, device="cuda", dtype=dtype)
+            for dtype in (torch.int64, torch.int64, torch.uint8)
+        ]
+        count = None
+        for n in (1, 2, 15, 16, 17, 64, 100, 128):
+            for offset in range(8):
+                srcs = [values[offset:][:n], indices[offset:][:n], flags[offset:][:n]]
+                dsts = [b[7 - offset :][:n] for b in backings]
+                self.assertTrue(try_small_copy(dsts, srcs))
+                self.assertTrue(torch.equal(dsts[0], srcs[0]))
+                self.assertTrue(torch.equal(dsts[1], srcs[1].long()))
+                self.assertTrue(torch.equal(dsts[2], srcs[2]))
+                if count is None:
+                    count = len(kernel_cache)
+                self.assertEqual(len(kernel_cache), count)
+
 
 if __name__ == "__main__":
     unittest.main()

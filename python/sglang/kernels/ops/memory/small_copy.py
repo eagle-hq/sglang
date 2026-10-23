@@ -2,11 +2,38 @@ import torch
 import triton
 import triton.language as tl
 
+# Triton specializes the ints and pointers inside a tuple argument on their
+# values (equal to 1, divisible by 16, 16-byte aligned) whatever
+# do_not_specialize says. These copies run before every CUDA graph replay with
+# sizes that follow the batch and sources wherever the allocator put them, so a
+# cold server kept compiling new kernel variants on the scheduler while it
+# served. Every runtime value is passed as 2 * value + 3 instead, which is odd
+# and above 1, and decoded in the kernel: one compiled kernel per field layout.
 
-@triton.jit(
-    do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
-    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
-)
+
+def _encode(value):
+    return 2 * value + 3
+
+
+@triton.jit
+def _decode(encoded):
+    return (encoded - 3) >> 1
+
+
+@triton.jit
+def _pointer(encoded, BITS: tl.constexpr):
+    address = _decode(encoded)
+    if BITS == 8:
+        return address.to(tl.pointer_type(tl.int8))
+    elif BITS == 16:
+        return address.to(tl.pointer_type(tl.int16))
+    elif BITS == 32:
+        return address.to(tl.pointer_type(tl.int32))
+    else:
+        return address.to(tl.pointer_type(tl.int64))
+
+
+@triton.jit
 def _small_copy_kernel(
     sources,
     destinations,
@@ -14,37 +41,29 @@ def _small_copy_kernel(
     cols,
     source_strides,
     dest_strides,
-    BIT_WIDTHS: tl.constexpr,
+    SOURCE_BITS: tl.constexpr,
+    DEST_BITS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     field = tl.program_id(0)
     offsets = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
-    for i in tl.static_range(len(BIT_WIDTHS)):
+    for i in tl.static_range(len(SOURCE_BITS)):
         if field == i:
-            src_offset = (
-                offsets // cols[i] * source_strides[i][0]
-                + offsets % cols[i] * source_strides[i][1]
+            c = _decode(cols[i])
+            row = offsets // c
+            col = offsets % c
+            src_offset = row * _decode(source_strides[i][0]) + col * _decode(
+                source_strides[i][1]
             )
-            dst_offset = (
-                offsets // cols[i] * dest_strides[i][0]
-                + offsets % cols[i] * dest_strides[i][1]
+            dst_offset = row * _decode(dest_strides[i][0]) + col * _decode(
+                dest_strides[i][1]
             )
-            src = sources[i]
-            dst = destinations[i]
-            if BIT_WIDTHS[i] == 8:
-                src = src.to(tl.pointer_type(tl.uint8))
-                dst = dst.to(tl.pointer_type(tl.uint8))
-            elif BIT_WIDTHS[i] == 16:
-                src = src.to(tl.pointer_type(tl.uint16))
-                dst = dst.to(tl.pointer_type(tl.uint16))
-            elif BIT_WIDTHS[i] == 32:
-                src = src.to(tl.pointer_type(tl.uint32))
-                dst = dst.to(tl.pointer_type(tl.uint32))
-            elif BIT_WIDTHS[i] == 64:
-                src = src.to(tl.pointer_type(tl.uint64))
-                dst = dst.to(tl.pointer_type(tl.uint64))
-            values = tl.load(src + src_offset, offsets < sizes[i], other=0)
-            tl.store(dst + dst_offset, values, offsets < sizes[i])
+            # Same widths copy the bits; int32 <-> int64 index copies convert.
+            src = _pointer(sources[i], SOURCE_BITS[i])
+            dst = _pointer(destinations[i], DEST_BITS[i])
+            mask = offsets < _decode(sizes[i])
+            values = tl.load(src + src_offset, mask, other=0)
+            tl.store(dst + dst_offset, values, mask)
 
 
 _SUPPORTED_DTYPES = frozenset(
@@ -64,14 +83,13 @@ _SUPPORTED_DTYPES = frozenset(
 _INDEX_DTYPES = frozenset((torch.int32, torch.int64))
 
 
-def _byte_range(tensor, n, row_stride, col_stride, cols):
+def _byte_range(first, element_size, n, row_stride, col_stride, cols):
     # Bytes the 1-D or 2-D tensor spans; strides as passed to the kernel.
-    first = tensor.data_ptr()
     if not n:
         return first, first
     rows = n // cols
     extent = (rows - 1) * row_stride + (cols - 1) * col_stride + 1
-    return first, first + extent * tensor.element_size()
+    return first, first + extent * element_size
 
 
 def try_small_copy(dsts, srcs):
@@ -82,8 +100,8 @@ def try_small_copy(dsts, srcs):
     device = dsts[0].device
     if device.type != "cuda":
         return False
-    sizes, cols, src_strides, dst_strides, bit_widths = [], [], [], [], []
-    src_ranges, dst_ranges = [], []
+    sizes, cols, src_strides, dst_strides = [], [], [], []
+    src_bits, dst_bits, src_ranges, dst_ranges = [], [], [], []
     for dst, src in zip(dsts, srcs):
         dst_dtype = dst.dtype
         src_dtype = src.dtype
@@ -119,9 +137,12 @@ def try_small_copy(dsts, srcs):
         cols.append(c)
         src_strides.append(ss)
         dst_strides.append(ds)
-        bit_widths.append(dst.element_size() * 8 if same_dtype else 0)
-        src_ranges.append(_byte_range(src, n, ss[0], ss[1], c))
-        dst_ranges.append(_byte_range(dst, n, ds[0], ds[1], c))
+        src_size = src.element_size()
+        dst_size = dst.element_size()
+        src_bits.append(src_size * 8)
+        dst_bits.append(dst_size * 8)
+        src_ranges.append(_byte_range(src.data_ptr(), src_size, n, ss[0], ss[1], c))
+        dst_ranges.append(_byte_range(dst.data_ptr(), dst_size, n, ds[0], ds[1], c))
     for i, (first, last) in enumerate(dst_ranges):
         for j, (other_first, other_last) in enumerate(src_ranges):
             if first < other_last and other_first < last:
@@ -138,13 +159,14 @@ def try_small_copy(dsts, srcs):
     largest = max(sizes)
     if largest:
         _small_copy_kernel[(len(dsts), triton.cdiv(largest, 256))](
-            tuple(srcs),
-            tuple(dsts),
-            tuple(sizes),
-            tuple(cols),
-            tuple(src_strides),
-            tuple(dst_strides),
-            tuple(bit_widths),
+            tuple(_encode(first) for first, _ in src_ranges),
+            tuple(_encode(first) for first, _ in dst_ranges),
+            tuple(_encode(n) for n in sizes),
+            tuple(_encode(c) for c in cols),
+            tuple((_encode(row), _encode(col)) for row, col in src_strides),
+            tuple((_encode(row), _encode(col)) for row, col in dst_strides),
+            tuple(src_bits),
+            tuple(dst_bits),
             BLOCK=256,
         )
     return True
