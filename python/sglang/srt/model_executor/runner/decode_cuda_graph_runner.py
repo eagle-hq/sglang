@@ -397,13 +397,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- speculative graph variants (they set the widest forward)
         self._init_graph_variants()
 
-        # Attention backend
-        self.max_num_token = (
+        # Attention backend: its graph state keeps the uniform max_bs x width
+        # shape (backends derive tokens per request from it); the input and
+        # logits buffers hold the widest captured forward.
+        self.attn_max_num_token = (
             max(self.capture_num_tokens)
+            if self.capture_num_tokens is not None
+            else self.max_bs * self.captured_req_width
+        )
+        self.max_num_token = (
+            self.attn_max_num_token
             if self.capture_num_tokens is not None
             else self._max_captured_tokens()
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.attn_backend.init_cuda_graph_state(self.max_bs, self.attn_max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -592,7 +599,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                attn_backend.init_cuda_graph_state(self.max_bs, self.attn_max_num_token)
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -688,8 +695,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._metadata_glue = None
 
     def _max_captured_tokens(self) -> int:
-        """Tokens of the widest captured forward, which sizes the static
-        buffers. Variants may verify only small batches and decode larger ones
+        """Tokens of the widest captured forward, which sizes the static input
+        and logits buffers. Variants may verify only small batches and decode larger ones
         one token per request: a runner capturing native decode up to a
         no-spec batch then needs no-spec-sized buffers, not max_bs times the
         verify width (gigabytes of logits rows at a few hundred requests)."""
