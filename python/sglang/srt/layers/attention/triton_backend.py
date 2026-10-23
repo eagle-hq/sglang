@@ -1231,9 +1231,13 @@ class TritonAttnBackend(AttentionBackend):
             (1,), dtype=torch.int32, device=self.device
         )
 
+        # Every captured mode reads KV through kv_indptr[: bs + 1], one row per
+        # request, so the indices hold at most max_bs full contexts. Sizing them
+        # per token (max_num_tokens = max_bs * verify width) reserved 16 GB more
+        # at 512 requests and 16 verify tokens.
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (max_bs * self.max_context_len),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -1256,7 +1260,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_num_tokens * self.sliding_window_size),
+                    (max_bs * self.sliding_window_size),
                     dtype=torch.int64,
                     device=self.device,
                 )
