@@ -109,6 +109,13 @@ def _bare_runner(graph_variants=None):
     return runner
 
 
+def _no_prefix_tracking():
+    mamba = SimpleNamespace(enable_mamba_extra_buffer=False)
+    return mock.patch.object(
+        mod, "get_exec", return_value=SimpleNamespace(mamba=mamba)
+    )
+
+
 def _verify_batch(bs, width):
     return SimpleNamespace(
         batch_size=bs,
@@ -138,7 +145,8 @@ class TestDefaultIsNoVariants(CustomTestCase):
             create_decode_graph_variants=lambda info: asked.append(info) or provider
         )
         runner._metadata_glue = object()
-        runner._init_graph_variants()
+        with _no_prefix_tracking():
+            runner._init_graph_variants()
         self.assertIs(runner.graph_variants, provider)
         self.assertIsNone(runner._metadata_glue)
         # The provider learns the runner's role, mode, width and device only.
@@ -150,7 +158,8 @@ class TestDefaultIsNoVariants(CustomTestCase):
         plain = _bare_runner()
         glue = object()
         plain._metadata_glue = glue
-        plain._init_graph_variants()
+        with _no_prefix_tracking():
+            plain._init_graph_variants()
         self.assertIsNone(plain.graph_variants)
         self.assertIs(plain._metadata_glue, glue)
 
@@ -172,6 +181,20 @@ class TestDefaultIsNoVariants(CustomTestCase):
         self.assertTrue(tracks(spec, _Widths(), True))
         self.assertFalse(tracks(spec, _Widths(), False))
         self.assertFalse(tracks(SpeculativeAlgorithm.NONE, None, False))
+
+    def test_buffers_hold_the_widest_captured_forward(self):
+        class _VerifySmallDecodeLarge(_Widths):
+            def capture_variants(self, bs):
+                native = DecodeGraphVariant("decode", 1, ForwardMode.DECODE)
+                return [W4, native] if bs <= 2 else [native]
+
+        # Verify width 4 up to bs 2, native decode up to bs 4: 8 tokens, not
+        # max_bs * 4 (a verify-wide buffer at every no-spec batch size).
+        self.assertEqual(
+            _bare_runner(_VerifySmallDecodeLarge())._max_captured_tokens(), 8
+        )
+        self.assertEqual(_bare_runner(_Widths())._max_captured_tokens(), 16)
+        self.assertEqual(_bare_runner()._max_captured_tokens(), 16)
 
     def test_capture_without_provider_is_one_default_graph_per_bs(self):
         runner = _bare_runner()

@@ -375,11 +375,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "feature."
             )
 
+        # Captures the per-replay attention-metadata prep into a small CUDA
+        # graph; see metadata_glue_graph.py for the correctness contract.
+        # Force-off for DFlash-family spec: verify installs host-fed fast
+        # plans (sync-free begin_forward that recomputes plan inputs on the
+        # host every replay), and capturing one freezes the capture-time
+        # plan — drafts go stale and accept length collapses to ~1.
+        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+            logger.warning(
+                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
+                "DFlash-family speculative decoding (host-fed fast verify "
+                "plans must re-run on the host every replay); disabling the "
+                "metadata glue graph."
+            )
+            enable_metadata_glue = False
+        self._metadata_glue = (
+            MetadataGlueGraph(self.device) if enable_metadata_glue else None
+        )
+
+        # --- speculative graph variants (they set the widest forward)
+        self._init_graph_variants()
+
         # Attention backend
         self.max_num_token = (
             max(self.capture_num_tokens)
             if self.capture_num_tokens is not None
-            else self.max_bs * self.captured_req_width
+            else self._max_captured_tokens()
         )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
@@ -409,28 +431,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_req=self.captured_req_width,
             )
-
-        # Captures the per-replay attention-metadata prep into a small CUDA
-        # graph; see metadata_glue_graph.py for the correctness contract.
-        # Force-off for DFlash-family spec: verify installs host-fed fast
-        # plans (sync-free begin_forward that recomputes plan inputs on the
-        # host every replay), and capturing one freezes the capture-time
-        # plan — drafts go stale and accept length collapses to ~1.
-        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
-            logger.warning(
-                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
-                "plans must re-run on the host every replay); disabling the "
-                "metadata glue graph."
-            )
-            enable_metadata_glue = False
-        self._metadata_glue = (
-            MetadataGlueGraph(self.device) if enable_metadata_glue else None
-        )
-
-        # --- speculative graph variants --------------------------------
-        self._init_graph_variants()
 
         enable_mamba_track = self._tracks_mamba()
 
@@ -686,6 +686,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "glue graph."
             )
             self._metadata_glue = None
+
+    def _max_captured_tokens(self) -> int:
+        """Tokens of the widest captured forward, which sizes the static
+        buffers. Variants may verify only small batches and decode larger ones
+        one token per request: a runner capturing native decode up to a
+        no-spec batch then needs no-spec-sized buffers, not max_bs times the
+        verify width (gigabytes of logits rows at a few hundred requests)."""
+        return max(
+            bs
+            * max(
+                (
+                    self.captured_req_width if v is None else v.num_tokens_per_req
+                    for v in self._capture_graph_variants(bs)
+                ),
+                default=1,
+            )
+            for bs in self.capture_bs
+        )
 
     def _graph_key_for(
         self, graph_key: ShapeKey, variant: Optional[DecodeGraphVariant]
